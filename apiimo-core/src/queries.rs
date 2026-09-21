@@ -2,12 +2,13 @@ use std::fs;
 use std::path::Path;
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{io_error, json_error, Error};
 
 /// A class/struct/interface match from `dump.cs`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClassMatch {
     pub namespace: String,
     pub name: String,
@@ -15,7 +16,7 @@ pub struct ClassMatch {
 }
 
 /// A method match from `dump.cs`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MethodMatch {
     pub class_name: String,
     pub signature: String,
@@ -25,14 +26,14 @@ pub struct MethodMatch {
 }
 
 /// A method address match from `script.json`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddressMatch {
     pub address: u64,
     pub name: String,
 }
 
 /// A string literal match from `script.json`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StringLiteralMatch {
     pub address: u64,
     pub value: String,

@@ -291,7 +291,7 @@ pub fn recover_key_with_period(ciphertext: &[u8], period: usize) -> Result<Vec<u
     if !trigrams.is_empty() {
         let total: usize = trigrams.values().sum();
         let default_log_probability = 1e-9_f64.ln();
-        let score = |remainder: usize, candidate: u8| -> f64 {
+        let positions_for = |remainder: usize| -> Vec<usize> {
             let mut positions = Vec::new();
             let mut position = remainder;
             while position < segment_end.saturating_sub(2) {
@@ -300,9 +300,11 @@ pub fn recover_key_with_period(ciphertext: &[u8], period: usize) -> Result<Vec<u
                 }
                 position += period;
             }
-
+            positions
+        };
+        let score = |positions: &[usize], candidate: u8| -> f64 {
             let mut result = 0.0;
-            for position in positions {
+            for &position in positions {
                 let context = [
                     decrypted[position - 2],
                     decrypted[position - 1],
@@ -333,20 +335,13 @@ pub fn recover_key_with_period(ciphertext: &[u8], period: usize) -> Result<Vec<u
         };
 
         for (remainder, key_byte) in key.iter_mut().enumerate() {
-            let mut positions = Vec::new();
-            let mut position = remainder;
-            while position < segment_end.saturating_sub(2) {
-                if position >= segment_start + 2 {
-                    positions.push(position);
-                }
-                position += period;
-            }
+            let positions = positions_for(remainder);
             if positions.len() < 200 {
                 continue;
             }
 
             let mut best_candidate = *key_byte;
-            let mut best_score = score(remainder, best_candidate);
+            let mut best_score = score(&positions, best_candidate);
             for candidate in 0..=u8::MAX {
                 if candidate == best_candidate {
                     continue;
@@ -358,7 +353,7 @@ pub fn recover_key_with_period(ciphertext: &[u8], period: usize) -> Result<Vec<u
                 if printable_count * 100 < positions.len() * 93 {
                     continue;
                 }
-                let candidate_score = score(remainder, candidate);
+                let candidate_score = score(&positions, candidate);
                 if candidate_score > best_score + 1.0 {
                     best_score = candidate_score;
                     best_candidate = candidate;

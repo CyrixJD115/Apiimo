@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "crates/apiimo-core",
-    "crates/apiimo-crypto",
-    "crates/apiimo-network",
-    "crates/apiimo-api",
+    "apiimo-core",
+    "apiimo-crypto",
+    "apiimo-network",
+    "apiimo-api",
 ]
 resolver = "2"
 
@@ -14,10 +14,12 @@ license = "GPL-3.0-only"
 rust-version = "1.74"
 
 [workspace.dependencies]
-apiimo-core = { path = "crates/apiimo-core", version = "0.1.0" }
-apiimo-crypto = { path = "crates/apiimo-crypto", version = "0.1.0" }
-apiimo-network = { path = "crates/apiimo-network", version = "0.1.0" }
+apiimo-core = { path = "apiimo-core", version = "0.1.0" }
+apiimo-crypto = { path = "apiimo-crypto", version = "0.1.0" }
+apiimo-network = { path = "apiimo-network", version = "0.1.0" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+ruzstd = "0.7"
+zip = { version = "2", default-features = false, features = ["deflate"] }

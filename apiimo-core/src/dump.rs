@@ -3,6 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{io_error, Error};
 use crate::metadata::rebuild_metadata;
 use crate::paths::{binary_path, metadata_path, output_path, DEC_NAME};
@@ -29,19 +31,21 @@ impl DumpOptions {
 }
 
 /// A generated output file reported by the pipeline.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedFile {
     pub name: String,
     pub size: u64,
 }
 
 /// Summary of one dump pipeline run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DumpReport {
     pub output_dir: PathBuf,
     pub decrypted_metadata: PathBuf,
     pub fixed_defaults: usize,
     pub was_encrypted: bool,
+    /// The dumper executable/dll actually invoked for this run.
+    pub dumper_command: PathBuf,
     pub dumper_succeeded: bool,
     pub dumper_error_count: usize,
     pub generated_files: Vec<GeneratedFile>,
@@ -63,7 +67,21 @@ pub fn run_dump(options: &DumpOptions) -> Result<DumpReport, Error> {
         return Err(Error::MissingFile(binary_file));
     }
 
-    let output = Command::new(&options.dumper_command)
+    // A .dll dumper path (the dotnet build published from apiimo-il2cpp) is
+    // spawned through the dotnet runtime rather than executed directly.
+    let mut command = if options
+        .dumper_command
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .ends_with(".dll")
+    {
+        let mut command = Command::new("dotnet");
+        command.arg(&options.dumper_command);
+        command
+    } else {
+        Command::new(&options.dumper_command)
+    };
+    let output = command
         .arg(&binary_file)
         .arg(&decrypted_metadata)
         .arg(&output_dir)
@@ -91,6 +109,7 @@ pub fn run_dump(options: &DumpOptions) -> Result<DumpReport, Error> {
         decrypted_metadata,
         fixed_defaults: rebuilt.fixed_defaults,
         was_encrypted: rebuilt.was_encrypted,
+        dumper_command: options.dumper_command.clone().into(),
         dumper_succeeded: output.status.success(),
         dumper_error_count: String::from_utf8_lossy(&output.stdout)
             .matches("Some errors")

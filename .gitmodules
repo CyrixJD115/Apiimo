@@ -1,0 +1,3 @@
+[submodule "apiimo-il2cpp"]
+	path = apiimo-il2cpp
+	url = https://github.com/c01ns/Il2CppDumper

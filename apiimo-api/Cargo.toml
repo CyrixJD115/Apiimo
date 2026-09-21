@@ -1,0 +1,19 @@
+[package]
+name = "apiimo-api"
+description = "CLI and library API facade for Apiimo; the boundary AniiStudio drives through ans-apiimo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+apiimo-core.workspace = true
+apiimo-network.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ruzstd.workspace = true
+
+[[bin]]
+name = "apiimo"
+path = "src/main.rs"

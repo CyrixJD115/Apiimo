@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
@@ -6,7 +7,7 @@ use apiimo_crypto::{decrypt_body, embedded_key, recover_key, HEADER_SIZE, SANITY
 use crate::error::Error;
 
 /// A metadata section's absolute file offset and byte size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataSection {
     pub offset: usize,
     pub size: usize,
@@ -371,17 +372,23 @@ fn verify_layout(metadata: &[u8], layout: &MetadataLayout) -> Result<(), Error> 
     let events = layout
         .get("events")
         .ok_or_else(|| Error::InvalidMetadata("events section is missing".into()))?;
+    // v31 TypeDefinition: `token` at byte 84, sizeof 88. The Python tool checks
+    // word 21 (`to`) and word 43 (`to + 22`) — the tokens of two consecutive
+    // type definitions, 22 words apart.
+    const TYPE_DEFINITION_SIZE: usize = 88;
+    const TYPE_TOKEN_OFFSET: usize = 84;
+    const EVENT_TOKEN_OFFSET: usize = 20;
     let type_token_a = type_definitions
         .offset
-        .checked_add(21 * 4)
+        .checked_add(TYPE_TOKEN_OFFSET)
         .ok_or_else(|| Error::InvalidMetadata("type definition offset overflow".into()))?;
     let type_token_b = type_definitions
         .offset
-        .checked_add(22 * 4)
+        .checked_add(TYPE_TOKEN_OFFSET + TYPE_DEFINITION_SIZE)
         .ok_or_else(|| Error::InvalidMetadata("type definition offset overflow".into()))?;
     let event_token = events
         .offset
-        .checked_add(5 * 4)
+        .checked_add(EVENT_TOKEN_OFFSET)
         .ok_or_else(|| Error::InvalidMetadata("event offset overflow".into()))?;
     let type_a = read_u32(metadata, type_token_a)
         .ok_or_else(|| Error::InvalidMetadata("type-definition token is truncated".into()))?;
@@ -444,6 +451,33 @@ fn decrypt_with_embedded_key(raw: &[u8]) -> Result<Vec<u8>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_layout_checks_consecutive_type_tokens() {
+        // Small synthetic layout: two 88-byte type definitions followed by an
+        // event, mirroring where the token fields live in v31 metadata.
+        let layout = MetadataLayout::from_entries([
+            ("typeDefinitions", MetadataSection::new(0x100, 2 * 88)),
+            ("events", MetadataSection::new(0x1B0, 24)),
+        ]);
+        let mut metadata = vec![0_u8; 0x1C8];
+        // token of TypeDefinition[0] (byte 84) and [1] (byte 84 + 88): 0x02tttttt.
+        write_u32(&mut metadata, 0x100 + 84, 0x0200_0001).unwrap();
+        write_u32(&mut metadata, 0x100 + 84 + 88, 0x0200_0002).unwrap();
+        // token of EventInfo (byte 20): 0x14eeeeee.
+        write_u32(&mut metadata, 0x1B0 + 20, 0x1400_0003).unwrap();
+        assert!(verify_layout(&metadata, &layout).is_ok());
+
+        // A count field masquerading as the second token (the old bug: byte
+        // +88 instead of +172) must not pass verification.
+        write_u32(&mut metadata, 0x100 + 84 + 88, 0x0000_0010).unwrap();
+        assert!(verify_layout(&metadata, &layout).is_err());
+
+        // A non-table token on the first definition must fail as well.
+        write_u32(&mut metadata, 0x100 + 84 + 88, 0x0200_0002).unwrap();
+        write_u32(&mut metadata, 0x100 + 84, 0x0600_0009).unwrap();
+        assert!(verify_layout(&metadata, &layout).is_err());
+    }
 
     #[test]
     fn sanitize_defaults_replaces_invalid_records() {
