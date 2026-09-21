@@ -1,0 +1,9 @@
+[package]
+name = "apiimo-crypto"
+description = "Cryptographic and keystream primitives used by Apiimo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]

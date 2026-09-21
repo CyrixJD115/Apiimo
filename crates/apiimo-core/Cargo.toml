@@ -1,0 +1,13 @@
+[package]
+name = "apiimo-core"
+description = "Core metadata, PE, dump, and query logic for Apiimo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+apiimo-crypto.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
