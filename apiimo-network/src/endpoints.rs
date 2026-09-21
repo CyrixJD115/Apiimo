@@ -1,11 +1,11 @@
-//! Endpoint registry recovered from the Steam build.
+//! Endpoint registry recovered from the Steam build and a live session.
 //!
-//! Sources: `stringliteral.json` (45,240 literals), `dump.cs` class surface
-//! (`ProfileApiClient`/`FunPlus.WorldX.Utils.WorldXProfiler`, `SDK.FPC.dll`
-//! classes, XPatch manifests), and REPORT.md. The registry distinguishes
-//! production/stage/dev environments and public/internal classes: the
-//! `10.8.x.x` internal services are dev plant that shipped in production
-//! strings and are recorded for documentation, not for use.
+//! Sources: `stringliteral.json` (45,240 literals), `dump.cs` class surface,
+//! REPORT.md, and the 2026-09-21 live login (FPX `fpxui.log` and the
+//! `PHONESTCORE_HOOK` connection log in `Player.log`). The registry
+//! distinguishes production/stage/dev environments and public/internal
+//! classes: the `10.8.x.x` internal services are dev plant that shipped in
+//! production strings and are recorded for documentation, not for use.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +25,9 @@ pub enum EndpointEnvironment {
 pub enum EndpointClass {
     /// Game session/office API.
     GameApi,
+    /// Game gate: the KCP/websocket world-connection endpoints (host:port,
+    /// no HTTP scheme).
+    GameGate,
     /// FunPlus account / platform services.
     FunPlusPlatform,
     /// Anti-cheat / telemetry.
@@ -33,6 +36,10 @@ pub enum EndpointClass {
     Analytics,
     /// Content CDN / patch pipeline.
     ContentDelivery,
+    /// Per-player object storage (Aliyun OSS).
+    ObjectStorage,
+    /// Payment / IAP services.
+    Payment,
     /// Supporting service (translation, IP echo, store, docs).
     Auxiliary,
     /// Internal-only service that must not be contacted.
@@ -43,9 +50,13 @@ pub enum EndpointClass {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Endpoint {
     /// Scheme plus host (and port when non-default), e.g. `https://worldx-office-api.aniimo.com`.
+    /// Gate endpoints carry only the hostname here and their port in
+    /// [`Endpoint::port`].
     pub host: &'static str,
     /// Request path or path template (`{0}`-style format slots as shipped).
     pub path: &'static str,
+    /// Non-default port (gates, and HTTP services on explicit ports).
+    pub port: Option<u16>,
     pub purpose: &'static str,
     pub environment: EndpointEnvironment,
     pub class: EndpointClass,
@@ -62,10 +73,17 @@ impl Endpoint {
         Self {
             host,
             path,
+            port: None,
             purpose,
             environment,
             class,
         }
+    }
+
+    /// Attach an explicit port (gate endpoints).
+    pub const fn with_port(mut self, port: u16) -> Self {
+        self.port = Some(port);
+        self
     }
 
     /// The class of every internal-IP endpoint.
@@ -111,6 +129,37 @@ const fn aux(host: &'static str, path: &'static str, purpose: &'static str) -> E
         purpose,
         EndpointEnvironment::Production,
         EndpointClass::Auxiliary,
+    )
+}
+
+const fn gate(host: &'static str, port: u16, purpose: &'static str) -> Endpoint {
+    Endpoint::new(
+        host,
+        "",
+        purpose,
+        EndpointEnvironment::Production,
+        EndpointClass::GameGate,
+    )
+    .with_port(port)
+}
+
+const fn oss(host: &'static str, path: &'static str, purpose: &'static str) -> Endpoint {
+    Endpoint::new(
+        host,
+        path,
+        purpose,
+        EndpointEnvironment::Production,
+        EndpointClass::ObjectStorage,
+    )
+}
+
+const fn pay(host: &'static str, path: &'static str, purpose: &'static str) -> Endpoint {
+    Endpoint::new(
+        host,
+        path,
+        purpose,
+        EndpointEnvironment::Production,
+        EndpointClass::Payment,
     )
 }
 
@@ -372,5 +421,160 @@ pub const ENDPOINTS: &[Endpoint] = &[
         "http://10.8.45.77:6667",
         "/api/report",
         "internal reporting",
+    ),
+    // ------------------------------------------------------------------
+    // Live-session findings (2026-09-21): FPX bootstrap, payment, identity,
+    // announcement APIs, the game gates, per-player OSS buckets, and the
+    // public server-list CDN. Sources: fpxui.log, Player.log
+    // (PHONESTCORE_HOOK), and the fetched server_list_publish.json.
+    // ------------------------------------------------------------------
+    // -- FPX bootstrap ("store URL manager", endpoint 1800) --
+    Endpoint::new(
+        "https://worldx-ame.kingsgroupgames.com",
+        "/do/?p0=pc&p1=9&p2=1800&p3=api&g=worldx_global",
+        "FPX bootstrap: URLs, app_id/app_secret, IAP keys",
+        EndpointEnvironment::Production,
+        EndpointClass::FunPlusPlatform,
+    ),
+    // -- announcements / platform APIs seen in the live session --
+    Endpoint::new(
+        "https://announcement-web.funplus.com",
+        "/api/announce/list",
+        "announcement list",
+        EndpointEnvironment::Production,
+        EndpointClass::FunPlusPlatform,
+    ),
+    Endpoint::new(
+        "https://priv-platform-yimoo-api.funplus.com",
+        "/api/game/red-dot",
+        "red-dot (unread-badge) state",
+        EndpointEnvironment::Production,
+        EndpointClass::FunPlusPlatform,
+    ),
+    // -- identity / auth / account (from the FPX bootstrap config) --
+    Endpoint::new(
+        "https://fp-idauth-stage.funplus.com.cn",
+        "",
+        "FunPlus id-auth service",
+        EndpointEnvironment::Stage,
+        EndpointClass::FunPlusPlatform,
+    ),
+    Endpoint::new(
+        "https://store-funplusid-stage.funplus.com",
+        "",
+        "account HTML (FunPlus ID store)",
+        EndpointEnvironment::Stage,
+        EndpointClass::FunPlusPlatform,
+    ),
+    Endpoint::new(
+        "http://store-account-test.funplus.com",
+        "",
+        "roleInfoApiServer (test)",
+        EndpointEnvironment::Development,
+        EndpointClass::FunPlusPlatform,
+    ),
+    Endpoint::new(
+        "http://35.166.237.230:8989",
+        "",
+        "funplusApiServer (AWS, from bootstrap config)",
+        EndpointEnvironment::Development,
+        EndpointClass::FunPlusPlatform,
+    ),
+    Endpoint::new(
+        "http://47.100.233.173:10302",
+        "/api/version/list",
+        "versionConfig (Aliyun, from bootstrap config)",
+        EndpointEnvironment::Development,
+        EndpointClass::FunPlusPlatform,
+    ),
+    Endpoint::new(
+        "https://st.kingsgroupgames.com",
+        "/pc/faq",
+        "FAQ / login FAQ pages",
+        EndpointEnvironment::Production,
+        EndpointClass::Auxiliary,
+    ),
+    Endpoint::new(
+        "https://kg-img-upload-test.funplus.com.cn",
+        "",
+        "image upload (test)",
+        EndpointEnvironment::Development,
+        EndpointClass::FunPlusPlatform,
+    ),
+    Endpoint::new(
+        "http://upload-s3.funplus.com",
+        "/api/upload_s3",
+        "S3 upload service",
+        EndpointEnvironment::Production,
+        EndpointClass::FunPlusPlatform,
+    ),
+    // -- payment / IAP --
+    pay(
+        "https://fp-payment-worldx.kingsgroupgames.com",
+        "",
+        "payment API",
+    ),
+    pay(
+        "https://fp-payment-worldx-backup.kingsgroupgames.com",
+        "",
+        "payment API (backup)",
+    ),
+    // -- public server-list CDN --
+    cdn(
+        "https://worldx-global-cdn.kingsgroupgames.com",
+        "/server_list/server_list_publish.json",
+        "server list (public, unauthenticated)",
+    ),
+    cdn(
+        "https://worldx-global-cdn-backup.kingsgroupgames.com",
+        "/server_list/server_list_publish.json",
+        "server list (backup CDN)",
+    ),
+    // -- per-player object storage (presigned OSS4 URLs, 300s expiry) --
+    oss(
+        "https://worldx-global-assets.oss-us-east-1.aliyuncs.com",
+        "/us/prod/ClientInfo/{uid}_client_info_bin",
+        "per-player client-info blob (synced every ~3 min)",
+    ),
+    oss(
+        "https://worldx-global-assets.oss-us-east-1.aliyuncs.com",
+        "/us/prod/pet_jewelry/{uid}",
+        "per-player pet data",
+    ),
+    // -- game gates (KCP primary; raw host:port, observed live) --
+    gate(
+        "worldx-us-prod-singleworld-1000-gate.kingsgroupgames.com",
+        20000,
+        "single-world 1000 gate (the live account's world)",
+    ),
+    gate(
+        "worldx-us-prod-ms-gate-close.kingsgroupgames.com",
+        10000,
+        "US matchmaking-service gate",
+    ),
+    gate(
+        "worldx-ap-prod-ms-gate-close.kingsgroupgames.com",
+        10000,
+        "AP matchmaking-service gate",
+    ),
+    gate(
+        "eu-prod-ms.worldx-gate.kingsgroupgames.com",
+        10000,
+        "EU matchmaking-service gate",
+    ),
+    gate(
+        "47.89.130.56",
+        20000,
+        "game gate (raw Aliyun IP observed live)",
+    ),
+    gate(
+        "47.253.243.54",
+        10000,
+        "US MS gate (raw Aliyun IP, from server list)",
+    ),
+    gate(
+        "47.245.180.147",
+        10000,
+        "EU MS gate (raw Aliyun IP, from server list)",
     ),
 ];

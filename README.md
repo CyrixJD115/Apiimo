@@ -97,7 +97,16 @@ Steam -> FPX SDK (native) -> FPCUser/credentials (fpId, accountId,
 ```
 
 The `xdf` / `lua-strings` commands make the Lua protocol layer inspectable
-offline; finishing the gate handshake needs a runtime capture of one login.
+offline. A live login (2026-09-21) then confirmed the whole chain from the
+game's own logs (`fpxui.log` + the `PHONESTCORE_HOOK` lines in
+`Player.log`): Steam ticket -> FPX session_key/ticket -> login service ->
+KCP gate (`worldx-us-prod-singleworld-1000-gate...:20000`) with an
+encrypt-key-confirmation handshake, while per-player blobs (client info,
+pet data) sync to Aliyun OSS under presigned URLs. The registry now
+carries the gates, OSS buckets, payment services, and the public
+`server_list_publish.json` CDN; `ServerListPublish` parses that document,
+and `FpxTicket`/`FpxSessionKey`/`LiveIdentity` decode the observed
+credential structures (including the roleId "Class" prefix encoding).
 
 ## Library use
 

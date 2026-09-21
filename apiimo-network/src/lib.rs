@@ -24,11 +24,16 @@
 #![forbid(unsafe_code)]
 
 mod endpoints;
+mod gate;
 mod identity;
 mod lua;
 
 pub use endpoints::{Endpoint, EndpointClass, EndpointEnvironment, ENDPOINTS};
-pub use identity::{Credentials, FpcUser, GateSession, LoginFlowState, RoleInfo, ServerSelection};
+pub use gate::{ExternalAddr, LocalDir, ServerGroup, ServerListPublish};
+pub use identity::{
+    Credentials, FpcUser, FpxSessionKey, FpxTicket, GateSession, LiveIdentity, LoginFlowState,
+    PlatformSessionKey, RoleInfo, ServerSelection, TicketInfo, TicketPayload,
+};
 pub use lua::{LuaJitChunk, XdfContainer, XdfEntry};
 
 /// Errors surfaced by the network crate.
@@ -64,7 +69,7 @@ mod tests {
 
     #[test]
     fn endpoint_registry_is_populated() {
-        assert!(ENDPOINTS.len() >= 40);
+        assert!(ENDPOINTS.len() >= 60);
         assert!(ENDPOINTS
             .iter()
             .any(|e| e.host.contains("worldx-office-api")));
@@ -72,6 +77,15 @@ mod tests {
         assert!(ENDPOINTS
             .iter()
             .any(|e| e.environment == EndpointEnvironment::Stage));
+        // live-session additions
+        assert!(ENDPOINTS.iter().any(|e| e.class == EndpointClass::GameGate));
+        assert!(ENDPOINTS
+            .iter()
+            .any(|e| e.class == EndpointClass::ObjectStorage && e.path.contains("pet_jewelry")));
+        assert!(ENDPOINTS.iter().any(|e| e.class == EndpointClass::Payment));
+        assert!(ENDPOINTS
+            .iter()
+            .any(|e| e.host.contains("worldx-global-cdn")));
     }
 
     #[test]
