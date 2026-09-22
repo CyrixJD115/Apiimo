@@ -30,9 +30,14 @@ mod handshake;
 mod identity;
 mod lua;
 mod pb;
+mod rc4;
 mod rpc;
 
-pub use client::{GateConnection, GateError, GateFrame, GateProbeResult, read_frame, write_frame};
+pub use rc4::rc4;
+
+pub use client::{
+    GateConnection, GateError, GateFrame, GateProbeResult, GateStatus, read_frame, write_frame,
+};
 pub use endpoints::{Endpoint, EndpointClass, EndpointEnvironment, ENDPOINTS};
 pub use gate::{ExternalAddr, LocalDir, ServerGroup, ServerListPublish};
 pub use handshake::{

@@ -28,3 +28,4 @@ rmp = "0.8"
 rmp-serde = "1"
 rsa = { version = "0.9", features = ["sha1"] }
 rand = "0.8"
+ureq = { version = "2", default-features = false, features = ["tls"] }

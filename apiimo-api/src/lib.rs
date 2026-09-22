@@ -22,11 +22,12 @@ pub use dumper::{
 };
 pub use error::ApiError;
 
+use std::io::Read as _;
 use std::path::PathBuf;
 
 use apiimo_core::{
     default_game_dir, find_addresses, find_classes, find_fields, find_methods, find_strings,
-    load_script, output_path, run_dump, AddressMatch, ClassMatch, DumpOptions, DumpReport,
+    load_script, output_path, run_dump, AddressMatch, ClassMatch, DumpReport, DumpOptions,
     MethodMatch, PeImage, StringLiteralMatch, TYPES_IN_BINARY,
 };
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,30 @@ use serde::{Deserialize, Serialize};
 /// Lowercase hex encoding for raw byte output.
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Decode a hex string into bytes.
+pub(crate) fn decode_hex(s: &str) -> Result<Vec<u8>, std::num::ParseIntError> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        // pad a leading nibble so "abc" still parses deterministically
+        return Ok(decode_hex(&format!("0{s}"))?);
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
+        .collect()
+}
+
+/// One gate's liveness, as reported by `gate-status`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateStatusRow {
+    pub host: String,
+    pub port: u16,
+    pub purpose: String,
+    pub status: String,
+    pub token: Option<i64>,
+    pub detail: String,
 }
 
 /// Result limits mirroring the Python tool's command defaults.
@@ -94,6 +119,19 @@ pub enum Command {
     /// Full anonymous key exchange: token + our RSA-wrapped session key.
     /// Saves the key material for offline cipher analysis.
     GateHandshake { host: String, port: u16 },
+    /// Download this account's client-info save blob from the object
+    /// storage bucket (world-readable; no login involved).
+    SavePull { uid: String, out: PathBuf },
+    /// RC4-decrypt a captured gate stream with a session key (hex) and
+    /// report the gate frames found inside.
+    GateDecrypt {
+        key_hex: String,
+        input: PathBuf,
+        output: PathBuf,
+    },
+    /// Probe every known production game gate and classify each as up,
+    /// forbidden (maintenance), or unreachable.
+    GateStatus,
 }
 
 impl Command {
@@ -180,6 +218,24 @@ pub enum Output {
         gate_info: Option<String>,
         other: Vec<(u16, usize)>,
     },
+    /// Client-info save blob pulled from object storage.
+    SavePullResult {
+        uid: String,
+        url: String,
+        path: PathBuf,
+        raw_bytes: usize,
+        decoded_bytes: usize,
+        format: String,
+    },
+    /// RC4-decoded gate stream and the frames recovered from it.
+    GateDecryptResult {
+        key_bytes: usize,
+        input_bytes: usize,
+        output_path: PathBuf,
+        frames: Vec<String>,
+    },
+    /// Liveness of every known production game gate.
+    GateStatusTable { entries: Vec<GateStatusRow> },
     /// Raw bytes of one XDF entry.
     XdfBytes(Vec<u8>),
     /// Printable constant strings of one LuaJIT entry, with the chunk's
@@ -413,6 +469,175 @@ impl Apiimo {
                         .map(|f| (f.method, f.body.len()))
                         .collect(),
                 })
+            }
+            Command::SavePull { uid, out } => {
+                let url = format!(
+                    "https://worldx-global-assets.oss-us-east-1.aliyuncs.com/\
+                     us/prod/ClientInfo/{uid}_client_info_bin"
+                );
+                let response = ureq::get(&url).call().map_err(|error| {
+                    apiimo_network::NetworkError::Xdf(format!("save pull failed: {error}"))
+                })?;
+                let mut raw = Vec::new();
+                response
+                    .into_reader()
+                    .read_to_end(&mut raw)
+                    .map_err(|error| {
+                        apiimo_network::NetworkError::Xdf(format!("save read failed: {error}"))
+                    })?;
+                let raw_len = raw.len();
+                std::fs::write(out, &raw).map_err(|source| ApiError::Io {
+                    path: out.clone(),
+                    source,
+                })?;
+                // The blob is zstd-compressed; decode for immediate inspection.
+                let (decoded, format) = match ruzstd::StreamingDecoder::new(&raw[..]) {
+                    Ok(mut decoder) => {
+                        use std::io::Read;
+                        let mut plain = Vec::new();
+                        decoder
+                            .read_to_end(&mut plain)
+                            .map_err(|error| {
+                                apiimo_network::NetworkError::Xdf(format!(
+                                    "zstd decode failed: {error}"
+                                ))
+                            })?;
+                        let decoded_path = out.with_extension("bin");
+                        std::fs::write(&decoded_path, &plain).map_err(|source| ApiError::Io {
+                            path: decoded_path.clone(),
+                            source,
+                        })?;
+                        (plain.len(), format!("zstd -> {}", decoded_path.display()))
+                    }
+                    Err(_) => (raw_len, "raw (not zstd)".to_string()),
+                };
+                Ok(Output::SavePullResult {
+                    uid: uid.clone(),
+                    url,
+                    path: out.clone(),
+                    raw_bytes: raw_len,
+                    decoded_bytes: decoded,
+                    format,
+                })
+            }
+            Command::GateDecrypt {
+                key_hex,
+                input,
+                output,
+            } => {
+                let key = decode_hex(key_hex).map_err(|error| {
+                    apiimo_network::NetworkError::Xdf(format!("bad key hex: {error:?}"))
+                })?;
+                let mut data = std::fs::read(input).map_err(|source| ApiError::Io {
+                    path: input.clone(),
+                    source,
+                })?;
+                let input_len = data.len();
+                apiimo_network::rc4(&key, &mut data);
+                std::fs::write(output, &data).map_err(|source| ApiError::Io {
+                    path: output.clone(),
+                    source,
+                })?;
+                let mut frames = Vec::new();
+                let mut offset = 0usize;
+                for _ in 0..16 {
+                    if offset + 6 > data.len() {
+                        break;
+                    }
+                    let total = u32::from_le_bytes([
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
+                    ]) as usize;
+                    if total < 2 || offset + 4 + total > data.len() {
+                        frames.push(format!("(stream ends after {} bytes)", offset));
+                        break;
+                    }
+                    let method = u16::from_le_bytes([data[offset + 4], data[offset + 5]]);
+                    let body_end = (offset + 4 + total).min(data.len());
+                    frames.push(format!(
+                        "m{} {}B {}",
+                        method,
+                        total - 2,
+                        hex(&data[offset + 6..body_end.min(offset + 6 + 48)])
+                    ));
+                    offset += 4 + total;
+                }
+                Ok(Output::GateDecryptResult {
+                    key_bytes: key.len(),
+                    input_bytes: input_len,
+                    output_path: output.clone(),
+                    frames,
+                })
+            }
+            Command::GateStatus => {
+                use apiimo_network::{EndpointClass, GateStatus as GateState};
+                let mut entries = Vec::new();
+                for endpoint in apiimo_network::ENDPOINTS.iter() {
+                    if endpoint.class != EndpointClass::GameGate
+                        || endpoint.environment != apiimo_network::EndpointEnvironment::Production
+                    {
+                        continue;
+                    }
+                    let port = endpoint.port.unwrap_or(10000);
+                    let host = endpoint.host;
+                    let (status, token, detail) =
+                        match apiimo_network::GateConnection::connect(
+                            host,
+                            port,
+                            std::time::Duration::from_secs(4),
+                        ) {
+                            Ok(mut conn) => match conn.probe(4) {
+                                Ok(result) => {
+                                    let status = match result.status() {
+                                        GateState::Up => "UP",
+                                        GateState::Forbidden => "FORBIDDEN (maintenance)",
+                                        GateState::NoResponse => "NO RESPONSE",
+                                    };
+                                    let detail = result
+                                        .gate_info
+                                        .as_ref()
+                                        .map(|info| {
+                                            let f1 = info
+                                                .bytes(1)
+                                                .map(|b| String::from_utf8_lossy(b).into_owned())
+                                                .unwrap_or_default();
+                                            let f2 = info
+                                                .bytes(2)
+                                                .map(|b| String::from_utf8_lossy(b).into_owned())
+                                                .unwrap_or_default();
+                                            format!("gate-info: {f1:?} / {f2:?}")
+                                        })
+                                        .unwrap_or_default();
+                                    (
+                                        status,
+                                        result.encrypt_token.as_ref().map(|t| t.token),
+                                        detail,
+                                    )
+                                }
+                                Err(error) => (
+                                    "PROBE ERROR",
+                                    None,
+                                    format!("{error}"),
+                                ),
+                            },
+                            Err(error) => (
+                                "UNREACHABLE",
+                                None,
+                                format!("{error}"),
+                            ),
+                        };
+                    entries.push(GateStatusRow {
+                        host: host.to_string(),
+                        port,
+                        purpose: endpoint.purpose.to_string(),
+                        status: status.to_string(),
+                        token,
+                        detail,
+                    });
+                }
+                Ok(Output::GateStatusTable { entries })
             }
         }
     }

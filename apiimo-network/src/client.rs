@@ -41,6 +41,39 @@ pub struct GateProbeResult {
     pub other_frames: Vec<GateFrame>,
 }
 
+/// Liveness classification of a gate, derived from the 2026-09-22
+/// maintenance capture: a healthy gate issues an encrypt token; a gate in
+/// maintenance answers method 19 with the literal strings "FORBID" in
+/// both fields and no token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GateStatus {
+    /// Token issued; the gate is serving.
+    Up,
+    /// Method 19 carried FORBID/FORBID; maintenance or login-blocked.
+    Forbidden,
+    /// Connected but no token and no gate info.
+    #[default]
+    NoResponse,
+}
+
+impl GateProbeResult {
+    /// Classify this probe result.
+    pub fn status(&self) -> GateStatus {
+        if self.encrypt_token.is_some() {
+            return GateStatus::Up;
+        }
+        if let Some(info) = &self.gate_info {
+            let forbid = b"FORBID";
+            if info.bytes(1).map(|b| b == forbid).unwrap_or(false)
+                || info.bytes(2).map(|b| b == forbid).unwrap_or(false)
+            {
+                return GateStatus::Forbidden;
+            }
+        }
+        GateStatus::NoResponse
+    }
+}
+
 /// Errors from the gate transport.
 #[derive(Debug, thiserror::Error)]
 pub enum GateError {
@@ -199,15 +232,27 @@ pub struct SessionKeyMaterial {
 }
 
 impl SessionKeyMaterial {
-    /// Generate a 32-byte key with random padding (16-64 bytes each side).
+    /// Exact game algorithm, recovered from `GateClientProtobufHandler::
+    /// responseEncryptToken` in xlua.dll: a 16-byte seed hashed with SHA-1
+    /// becomes the 20-byte `key` (the RC4 session secret); random head
+    /// padding of 5..19 bytes and tail padding of 13..32 bytes wrap it in
+    /// the `EncryptKey` protobuf.
     pub fn generate() -> Self {
         let mut rng = rand::thread_rng();
-        let mut head = vec![0u8; 16 + (rng.next_u32() % 48) as usize];
-        let mut tail = vec![0u8; 16 + (rng.next_u32() % 48) as usize];
+        let head_len = 5 + (rng.next_u32() % 15) as usize;
+        let tail_len = 13 + (rng.next_u32() % 17) as usize;
+        let mut head = vec![0u8; head_len];
+        let mut tail = vec![0u8; tail_len];
         rng.fill_bytes(&mut head);
         rng.fill_bytes(&mut tail);
-        let mut key = vec![0u8; 32];
-        rng.fill_bytes(&mut key);
+        let mut seed = [0u8; 16];
+        rng.fill_bytes(&mut seed);
+        let key = {
+            use sha1::Digest;
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(seed);
+            hasher.finalize().to_vec()
+        };
         Self {
             key,
             head_padding: head,
@@ -245,6 +290,27 @@ impl SessionKeyMaterial {
         let body = self.encrypt_key_body(token);
         let mut rng = rand::thread_rng();
         let scheme = std::env::var("APIIMO_RSA").unwrap_or_default();
+        if scheme == "textbook" {
+            // Raw m^e mod n: the native client zero-pads the protobuf body
+            // to the modulus length before the RSA call, which is the same
+            // integer as the unpadded body.
+            use rsa::traits::PublicKeyParts;
+            let n = public_key.n().clone();
+            let e = public_key.e().clone();
+            let m = rsa::BigUint::from_bytes_be(&body);
+            if m >= n {
+                return Err(GateError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "rsa textbook: plaintext longer than modulus",
+                )));
+            }
+            let k = n.bits().div_ceil(8) as usize;
+            let c = m.modpow(&e, &n);
+            let bytes = c.to_bytes_be();
+            let mut ct = vec![0u8; k];
+            ct[k - bytes.len()..].copy_from_slice(&bytes);
+            return Ok((ct, "textbook"));
+        }
         if scheme == "oaep-sha1" {
             let ct = public_key
                 .encrypt(&mut rng, rsa::Oaep::new::<sha1::Sha1>(), &body)
@@ -323,8 +389,8 @@ impl GateConnection {
         self.write_frame(2, &key_string)?;
 
         let mut outcome = HandshakeOutcome { token, ..Default::default() };
-        for _ in 0..4 {
-            let raw = self.read_raw(Duration::from_secs(3))?;
+        for _ in 0..2 {
+            let raw = self.read_raw(Duration::from_secs(1))?;
             if raw.is_empty() {
                 break;
             }

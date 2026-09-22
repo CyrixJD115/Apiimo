@@ -126,6 +126,20 @@ where
             };
             Command::GateProbe { host, port }
         }
+        "save-pull" => {
+            let uid = arg(1, "save-pull <uid> [out]")?.to_string();
+            let out = args
+                .get(2)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(format!("client_info_{uid}.bin")));
+            Command::SavePull { uid, out }
+        }
+        "gate-decrypt" => Command::GateDecrypt {
+            key_hex: arg(1, "gate-decrypt <key_hex> <input> <output>")?.to_string(),
+            input: PathBuf::from(arg(2, "gate-decrypt <key_hex> <input> <output>")?),
+            output: PathBuf::from(arg(3, "gate-decrypt <key_hex> <input> <output>")?),
+        },
+        "gate-status" => Command::GateStatus,
         "xdf-cat" => Command::XdfCat {
             container: PathBuf::from(arg(1, "xdf-cat <path> <entry>")?),
             entry: arg(2, "xdf-cat <path> <entry>")?.to_string(),
@@ -313,6 +327,49 @@ pub fn render(output: &Output) -> String {
                 let _ = writeln!(text, "  other frame   : method={method} bytes={size}");
             }
         }
+        Output::SavePullResult {
+            uid,
+            url,
+            path,
+            raw_bytes,
+            decoded_bytes,
+            format,
+        } => {
+            use std::fmt::Write;
+            let _ = writeln!(text, "save blob for uid {uid}:");
+            let _ = writeln!(text, "  url      : {url}");
+            let _ = writeln!(text, "  saved    : {} ({} bytes)", path.display(), raw_bytes);
+            let _ = writeln!(text, "  decoded  : {decoded_bytes} bytes ({format})");
+        }
+        Output::GateDecryptResult {
+            key_bytes,
+            input_bytes,
+            output_path,
+            frames,
+        } => {
+            use std::fmt::Write;
+            let _ = writeln!(
+                text,
+                "rc4 stream decode: key={key_bytes}B input={input_bytes}B"
+            );
+            let _ = writeln!(text, "  written: {}", output_path.display());
+            for frame in frames {
+                let _ = writeln!(text, "  frame {frame}");
+            }
+        }
+        Output::GateStatusTable { entries } => {
+            use std::fmt::Write;
+            let _ = writeln!(text, "{:<46} {:<26} {}", "gate", "status", "detail");
+            for e in entries {
+                let _ = writeln!(
+                    text,
+                    "{:<46} {:<26} {}",
+                    format!("{}:{}", e.host, e.port),
+                    e.status,
+                    if e.detail.is_empty() { &e.purpose } else { &e.detail }
+                );
+            }
+        }
         Output::XdfBytes(bytes) => {
             use std::io::Write;
             std::io::stdout().write_all(bytes).expect("stdout write");
@@ -356,7 +413,10 @@ pub fn usage() -> String {
          \x20 lua-strings <path> <entry>  dump strings of a LuaJIT entry in an XDF\n\
          \x20 xdf-cat <path> <entry>      write one XDF entry's raw bytes to stdout\n\
          \x20 gate-probe [host:port]       request an encrypt token from a gate\n\
-         \x20 gate-handshake [host:port]    anonymous session-key exchange\n\n\
+         \x20 gate-handshake [host:port]    anonymous session-key exchange\n\
+         \x20 save-pull <uid> [out]        download your client-info save blob\n\
+         \x20 gate-decrypt <hex> <in> <out> RC4-decode a captured gate stream\n\
+         \x20 gate-status                   probe all known gates for up/maintenance\n\n\
          Options:\n\
          \x20 --out <dir>                 output directory (default: <game>/.dump)\n\
          \x20 --game <dir>                game root (default: APIIMO_GAME or auto-discovery)\n\
