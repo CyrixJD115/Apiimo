@@ -6,7 +6,6 @@ import "common_service.proto";
 package phonest.proto;
 
 service Gate2MicroService {
-	rpc regGateServer(GateInfo) returns(Void);                     // Gate向Service注册 deprecated
     rpc MicroServiceRequest (MsRequest) returns (Void);
     rpc MicroServiceResponse (MsResponse) returns (Void);
 	rpc RegServiceAck(MsRegistrationAck) returns (Void);

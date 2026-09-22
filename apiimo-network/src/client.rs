@@ -5,10 +5,10 @@
 //! where the length counts the method id + body. Observed on the
 //! latency/heartbeat control connections to the ms-gates.
 //!
-//! Empirical method ids (client→gate): 1 = requestEncryptToken,
-//! 2 = confirmEncryptKey. Gate→client pushes observed: 10 =
+//! Empirical method ids (client->gate): 1 = requestEncryptToken,
+//! 2 = confirmEncryptKey. Gate->client pushes observed: 10 =
 //! responseEncryptToken{token:int64}, 19 = gate info {field1:12B, field2:12B}.
-//! Unknown ids are surfaced raw — never treated as fatal.
+//! Unknown ids are surfaced raw - never treated as fatal.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -190,7 +190,7 @@ use rsa::pkcs1::DecodeRsaPublicKey;
 /// The session-key material we generate and hand to the gate, encrypted
 /// with the gate's RSA public key. Structure per `EncryptKey` in
 /// client_gate.proto: random head padding, the key bytes, the gate's
-/// token, random tail padding — so the key's position varies per
+/// token, random tail padding - so the key's position varies per
 /// connection (anti-replay, per the schema comments).
 pub struct SessionKeyMaterial {
     pub key: Vec<u8>,
@@ -272,7 +272,7 @@ impl SessionKeyMaterial {
 #[derive(Debug, Clone, Default)]
 pub struct HandshakeOutcome {
     pub token: i64,
-    /// Raw bytes the server sent after our confirmEncryptKey — the ack is
+    /// Raw bytes the server sent after our confirmEncryptKey - the ack is
     /// already cipher-protected; kept verbatim for offline analysis.
     pub post_confirm_frames: Vec<(bool, Vec<u8>)>,
 }

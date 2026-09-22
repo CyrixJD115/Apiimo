@@ -4,14 +4,14 @@
 //! containers. The shipping pack uses stored (uncompressed) entries with no
 //! encryption; patch packs fetched at runtime may use compression, and the
 //! client's own ZipFile layer refuses AES entries ("AES encrypted XDF zip
-//! entries are not supported") — so deflate and stored cover what the game
+//! entries are not supported") - so deflate and stored cover what the game
 //! itself will accept.
 //!
 //! Lua modules inside are compiled LuaJIT 2.x bytecode (magic `\x1bLJ`),
 //! not source. [`LuaJitChunk`] validates the header, surfaces the embedded
 //! chunk name (which leaks the build path), and extracts the printable
-//! constant strings — the field names, URLs, and protocol tokens the
-//! compiled code references — which is how the login-flow field names in
+//! constant strings - the field names, URLs, and protocol tokens the
+//! compiled code references - which is how the login-flow field names in
 //! this crate were recovered.
 
 use std::fs;

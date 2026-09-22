@@ -373,7 +373,7 @@ fn verify_layout(metadata: &[u8], layout: &MetadataLayout) -> Result<(), Error> 
         .get("events")
         .ok_or_else(|| Error::InvalidMetadata("events section is missing".into()))?;
     // v31 TypeDefinition: `token` at byte 84, sizeof 88. The Python tool checks
-    // word 21 (`to`) and word 43 (`to + 22`) — the tokens of two consecutive
+    // word 21 (`to`) and word 43 (`to + 22`) - the tokens of two consecutive
     // type definitions, 22 words apart.
     const TYPE_DEFINITION_SIZE: usize = 88;
     const TYPE_TOKEN_OFFSET: usize = 84;

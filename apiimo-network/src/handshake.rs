@@ -15,7 +15,7 @@
 
 use crate::pb::{decode, PbMessage};
 
-/// `EncryptToken` — gate-issued nonce for the session-key exchange.
+/// `EncryptToken` - gate-issued nonce for the session-key exchange.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EncryptToken {
     pub token: i64,
@@ -46,7 +46,7 @@ impl EncryptToken {
     }
 }
 
-/// `EncryptKey` — the client-generated session key material, sent
+/// `EncryptKey` - the client-generated session key material, sent
 /// RSA-encrypted inside an [`EncryptKeyString`]. The paddings are random
 /// so the key position and stream offsets differ per connection
 /// (anti-replay, per the schema comments).
@@ -87,7 +87,7 @@ impl EncryptKey {
     }
 }
 
-/// `EncryptKeyString` — the (encrypted) key exchange carrier.
+/// `EncryptKeyString` - the (encrypted) key exchange carrier.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EncryptKeyString {
     pub key_string: Vec<u8>,
@@ -133,7 +133,7 @@ impl ConnectReqType {
     }
 }
 
-/// `ConnectServerReq` — open a gate session. Per the schema comment this
+/// `ConnectServerReq` - open a gate session. Per the schema comment this
 /// step performs **no account verification**; authentication rides the
 /// service calls afterwards (or `auth` for the world gate).
 #[derive(Debug, Clone, Default)]
@@ -181,7 +181,7 @@ pub mod connect_resp_type {
     pub const RECONNECTED: i64 = 3;
 }
 
-/// `ConnectServerResp` — gate answer to [`ConnectServerReq`].
+/// `ConnectServerResp` - gate answer to [`ConnectServerReq`].
 #[derive(Debug, Clone, Default)]
 pub struct ConnectServerResp {
     pub resp_type: Option<i64>,

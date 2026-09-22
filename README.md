@@ -38,7 +38,7 @@ apiimo [--game <dir>] [--out <dir>] [--json] <command> [args]
 
 `--game` defaults to the `APIIMO_GAME` environment variable, then an
 upward walk looking for `GameAssembly.dll` / `Aniimo_Data`. `--json`
-prints the structured result instead of the human rendering — the shape
+prints the structured result instead of the human rendering - the shape
 AniiStudio consumes.
 
 The external `il2cpp-dumper` executable remains an explicit runtime
@@ -47,7 +47,7 @@ dependency of the dump pipeline, just as in the Python tool.
 ## Embedded dumper (`apiimo-il2cpp/` submodule)
 
 The repo pins [c01ns/Il2CppDumper](https://github.com/c01ns/Il2CppDumper)
-as a git submodule at `apiimo-il2cpp` — a fork with experimental support
+as a git submodule at `apiimo-il2cpp` - a fork with experimental support
 for newer Unity 6000.x metadata versions (v35/v38/v39) alongside the v31
 that Aniimo uses. The dumper can be **compiled into the `apiimo` binary
 itself**, making it fully self-contained (no dotnet, no PATH dumper
@@ -62,7 +62,7 @@ cargo build --release
 The script publishes the dumper as a self-contained single-file
 executable, compresses it (zstd, ~24 MB) into
 `apiimo-api/assets/il2cpp-dumper.sfx.zst`, and `include_bytes!` embeds it
-at compile time. `cargo build` still works without running the script —
+at compile time. `cargo build` still works without running the script -
 the assets are placeholders and the binary simply uses the PATH
 fallback.
 
@@ -110,17 +110,17 @@ credential structures (including the roleId "Class" prefix encoding).
 
 ## Protocol layer (`apiimo-network`)
 
-The gate protocol is fully decoded and implemented as library types —
+The gate protocol is fully decoded and implemented as library types -
 the game's own `.proto` schemas are vendored under `apiimo-network/proto/`
 (extracted verbatim from `LuaScripts.xdf`, package `phonest.proto`):
 
-- `pb` — minimal protobuf wire codec (varint/bytes/nested, tolerant decode)
-- `handshake` — EncryptToken/EncryptKey/ConnectServerReq/Resp/Heartbeat
-- `rpc` — MsRequest/MsResponse (protocol 33), the `POST /rpc` JSON
+- `pb` - minimal protobuf wire codec (varint/bytes/nested, tolerant decode)
+- `handshake` - EncryptToken/EncryptKey/ConnectServerReq/Resp/Heartbeat
+- `rpc` - MsRequest/MsResponse (protocol 33), the `POST /rpc` JSON
   envelope with base64-msgpack params, and the known service-method
   registry (`LoginService.verifySdk`, `RoleService.CS_Login`,
   `KvService.kvServiceFind`, ...)
-- `identity` — FpxTicket/FpxSessionKey parsers and the
+- `identity` - FpxTicket/FpxSessionKey parsers and the
   `VerifySdkRequest/Response`, `CsLoginRequest/CsLogoutRequest` contracts
 
 A full login replay additionally needs the gate TCP framing and the RSA

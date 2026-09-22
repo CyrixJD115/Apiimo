@@ -1,13 +1,13 @@
 //! Micro-service RPC envelope and codec.
 //!
 //! The game's services (`LoginService`, `RoleService`, `KvService`, ...)
-//! are called with [`MsRequest`] messages — over the gate as
+//! are called with [`MsRequest`] messages - over the gate as
 //! `MicroServiceRequest` (protocol 33, `EnumMicroProtocol`) or over the
 //! HTTP fallback `POST /rpc`. Schemas: `common_service.proto` (vendored in
 //! [`crate::PROTO_FILES`]).
 //!
 //! `params` is codec-encoded: the client's `ProtoCodec` uses
-//! **MessagePack** (and the HTTP path additionally base64-wraps it — see
+//! **MessagePack** (and the HTTP path additionally base64-wraps it - see
 //! [`http_rpc_body`]).
 
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,7 @@ pub mod micro_protocol {
     pub const MICRO_PUSH: u32 = 35;
 }
 
-/// `MsRequest` — one service call.
+/// `MsRequest` - one service call.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MsRequest {
     pub rid: Option<u64>,
@@ -139,7 +139,7 @@ impl MsRequest {
     }
 }
 
-/// `MsResponse` — a service reply.
+/// `MsResponse` - a service reply.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MsResponse {
     pub rid: Option<u64>,

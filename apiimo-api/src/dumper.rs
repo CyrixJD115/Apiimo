@@ -41,7 +41,7 @@ pub fn embedded_available() -> bool {
 }
 
 /// FNV-1a 64-bit hash, used to fingerprint the embedded bundle for cache
-/// directory naming (not cryptographic — it only distinguishes builds).
+/// directory naming (not cryptographic - it only distinguishes builds).
 pub fn fnv1a64(data: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &byte in data {

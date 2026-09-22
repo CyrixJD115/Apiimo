@@ -2,7 +2,6 @@ syntax = "proto2";
 import "common.proto";
 package phonest.proto;
 option cc_generic_services = false;
-// 注册请求
 message AgentRegisterReq{
     required string ip = 1;
     required int32 port = 2;
@@ -13,22 +12,18 @@ message AgentRegisterReq{
     optional string node = 7;
     optional bytes labels = 8;  // custom labels, map packed data
 } 
-// 消息数据
 message AgentMessageReq{
     required bytes message = 1;
 }
 
-//心跳包 
 message HeartbeatReq {
     optional int64 time = 1;
 }
 
-//心跳回包
 message HeartbeatResp{
     optional int64 time = 1;
 }
 
-//关闭请求
 message ClientUnregisterReq{
 
 }

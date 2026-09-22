@@ -3,13 +3,13 @@
 //! Field names mirror the game's own contracts exactly, so JSON produced or
 //! consumed here matches the client:
 //!
-//! - `FPCUser` — `SDK.FPC.dll` `FPCUser` (fpId, userName, sessionKey, ...).
-//! - `Credentials` — `SDKManager.OnLoginFromMobile(code, fpId, accountId,
+//! - `FPCUser` - `SDK.FPC.dll` `FPCUser` (fpId, userName, sessionKey, ...).
+//! - `Credentials` - `SDKManager.OnLoginFromMobile(code, fpId, accountId,
 //!   ticket, sessionKey)` and the `XCloudPipeController` `CMDFPSDK*` fields.
-//! - `GateSession` — `LoginAgent.lua` handshake payload fields
+//! - `GateSession` - `LoginAgent.lua` handshake payload fields
 //!   (token, serverId, sessionId, GlobalGateSessionId) and the
 //!   `roleInfo.players` selection step.
-//! - `ServerSelection` — `LoginServerComponent.lua` per-account cached
+//! - `ServerSelection` - `LoginServerComponent.lua` per-account cached
 //!   server choice (`OVERSEA_SERVER_ID_KEY_FORMAT` keyed by accountId).
 
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,7 @@ use crate::NetworkError;
 /// A FunPlus account, mirroring `SDK.FPC.dll`'s `FPCUser`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FpcUser {
-    /// FunPlus ID — the primary account identifier ("fpID" in the client).
+    /// FunPlus ID - the primary account identifier ("fpID" in the client).
     #[serde(rename = "fpId", alias = "fpID")]
     pub fp_id: String,
     /// Channel account id (e.g. the Steam-scoped id; "accountId" at login).
@@ -111,7 +111,7 @@ pub enum LoginFlowState {
     GateConnect,
     /// Choosing among `roleInfo.players`.
     SelectRole,
-    /// `LoginLoadWorld`: world parts streaming in — this is where the
+    /// `LoginLoadWorld`: world parts streaming in - this is where the
     /// player's data materializes client-side.
     LoadWorld,
     /// In-world; the session is fully established.
@@ -353,7 +353,7 @@ pub struct LiveIdentity {
 }
 
 impl LiveIdentity {
-    /// The entity-class prefix of the roleId — the "Class" number the game
+    /// The entity-class prefix of the roleId - the "Class" number the game
     /// shows on the profile (e.g. `3020011` for roleId `302001142689`).
     pub fn role_class(&self) -> &str {
         &self.role_id[..self.role_id.len().min(7)]
@@ -472,7 +472,7 @@ pub struct VerifySdkResponse {
     pub global_gate_id: Option<String>,
     #[serde(default, rename = "ServerId", alias = "serverId")]
     pub server_id: Option<String>,
-    /// `roleInfo.players` — the account's characters.
+    /// `roleInfo.players` - the account's characters.
     #[serde(default, rename = "RoleInfo")]
     pub role_info: Option<RoleInfo>,
     #[serde(default, rename = "errmsg")]

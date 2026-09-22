@@ -286,7 +286,7 @@ pub fn render(output: &Output) -> String {
                 let _ = writeln!(text, "  frame {frame}");
             }
             if frames.is_empty() {
-                let _ = writeln!(text, "  (no server bytes after confirm — silent ack?)");
+                let _ = writeln!(text, "  (no server bytes after confirm - silent ack?)");
             }
         }
         Output::GateProbeResult {

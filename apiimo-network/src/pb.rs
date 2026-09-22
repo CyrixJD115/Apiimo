@@ -2,7 +2,7 @@
 //!
 //! Enough to encode/decode the `phonest.proto` messages the gate protocol
 //! needs: varint fields, length-delimited bytes/strings, and nested
-//! messages, with unknown-field tolerance. No schema compiler dependency —
+//! messages, with unknown-field tolerance. No schema compiler dependency -
 //! the messages in [`crate::handshake`] and [`crate::rpc`] hand-map the
 //! field numbers from the vendored `.proto` files.
 
