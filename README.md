@@ -1,11 +1,10 @@
 # Apiimo
 
 Apiimo is a Rust workspace for the Aniimo metadata and binary-analysis
-toolkit. It is a verified port of the original Python implementation
-(kept for reference under `Apiimo_py/`): running the full dump pipeline
-with the Rust `apiimo` binary reproduces the Python tool's
-`global-metadata.decrypted.dat` and `dump.cs` byte for byte, in about a
-third of the time.
+toolkit. It is a verified port of the original Python implementation:
+running the full dump pipeline with the Rust `apiimo` binary reproduces
+the Python tool's `global-metadata.decrypted.dat` and `dump.cs` byte for
+byte, in about a third of the time.
 
 ## Workspace
 
@@ -34,6 +33,14 @@ apiimo [--game <dir>] [--out <dir>] [--json] <command> [args]
   off2va <off_hex>            file offset -> VA
   patch <va_hex> <hexbytes>   patch GameAssembly.dll in place
   discover                    experimental: rediscover section layout
+  xdf <path> [filter]         list XDF container entries (LuaScripts.xdf)
+  lua-strings <path> <entry>  strings of a LuaJIT entry in an XDF
+  xdf-cat <path> <entry>      write one XDF entry's raw bytes to stdout
+  gate-probe [host:port]      request an encrypt token from a gate
+  gate-handshake [host:port]  anonymous session-key exchange
+  save-pull <uid> [out]       download a client-info save blob (OSS, no login)
+  gate-decrypt <hex> <in> <out>  RC4-decode a captured gate stream
+  gate-status                 probe all known gates for up/maintenance
 ```
 
 `--game` defaults to the `APIIMO_GAME` environment variable, then an
@@ -116,6 +123,7 @@ the game's own `.proto` schemas are vendored under `apiimo-network/proto/`
 
 - `pb` - minimal protobuf wire codec (varint/bytes/nested, tolerant decode)
 - `handshake` - EncryptToken/EncryptKey/ConnectServerReq/Resp/Heartbeat
+- `rc4` - the confirmed gate session cipher (RFC test vector)
 - `rpc` - MsRequest/MsResponse (protocol 33), the `POST /rpc` JSON
   envelope with base64-msgpack params, and the known service-method
   registry (`LoginService.verifySdk`, `RoleService.CS_Login`,
@@ -123,9 +131,35 @@ the game's own `.proto` schemas are vendored under `apiimo-network/proto/`
 - `identity` - FpxTicket/FpxSessionKey parsers and the
   `VerifySdkRequest/Response`, `CsLoginRequest/CsLogoutRequest` contracts
 
-A full login replay additionally needs the gate TCP framing and the RSA
-public key source (see `tools/lua-disasm/` for the disassembly toolchain
-used to recover all of this).
+### What is proven on the live protocol
+
+- Wire framing `[u32 LE total][u16 LE method][protobuf]`, verified
+  against production gates; `gate-probe` receives real encrypt tokens.
+- Session cipher: **RC4** (`AlgorithmRc4` in the game's native
+  `xlua.dll`), keyed with a 20-byte `SHA1(16-byte seed)` generated with
+  the exact pad sizes (head 5..19, tail 13..32) recovered from the
+  native `responseEncryptToken` handler. `SessionKeyMaterial::generate`
+  implements it exactly.
+- RSA wrap: the plaintext is the `EncryptKey` protobuf, zero-padded to
+  the modulus length. `APIIMO_RSA` selects `textbook`, `oaep-sha1`, or
+  the default PKCS#1 v1.5. Remaining unknown: which per-gate public key
+  the production gates load (each gate IP has its own; see the
+  workspace key-hunt report).
+- Server status: a gate in maintenance answers method 19 with literal
+  `FORBID`/`FORBID` and no token - `gate-status` classifies it.
+- `save-pull` downloads a client-info save blob from the world-readable
+  OSS object storage without any login (own account only by convention).
+
+`tools/lua-disasm/` holds the LuaJIT disassembly toolchain used to
+recover the protocol layer from `LuaScripts.xdf`.
+
+## Related projects
+
+- **AniiStudio** - the frontend workspace this library feeds through the
+  `Command`/`Output` API (evidence, captures, reports).
+- **Serviimo** - the server-side twin: a personal-use reimplementation
+  of the gate/office/CDN stack, reusing `apiimo-network` as the
+  protocol library (listener half of `GateConnection`).
 
 ## Library use
 
