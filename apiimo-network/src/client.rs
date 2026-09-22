@@ -178,3 +178,159 @@ mod tests {
         assert_eq!(buf, vec![0x02, 0x00, 0x00, 0x00, 0x01, 0x00]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Session-key exchange (confirmEncryptKey)
+// ---------------------------------------------------------------------------
+
+use rand::RngCore;
+use rsa::pkcs1::DecodeRsaPublicKey;
+use rsa::traits::PublicKeyParts;
+
+/// The session-key material we generate and hand to the gate, encrypted
+/// with the gate's RSA public key. Structure per `EncryptKey` in
+/// client_gate.proto: random head padding, the key bytes, the gate's
+/// token, random tail padding — so the key's position varies per
+/// connection (anti-replay, per the schema comments).
+pub struct SessionKeyMaterial {
+    pub key: Vec<u8>,
+    pub head_padding: Vec<u8>,
+    pub tail_padding: Vec<u8>,
+}
+
+impl SessionKeyMaterial {
+    /// Generate a 32-byte key with random padding (16-64 bytes each side).
+    pub fn generate() -> Self {
+        let mut rng = rand::thread_rng();
+        let mut head = vec![0u8; 16 + (rng.next_u32() % 48) as usize];
+        let mut tail = vec![0u8; 16 + (rng.next_u32() % 48) as usize];
+        rng.fill_bytes(&mut head);
+        rng.fill_bytes(&mut tail);
+        let mut key = vec![0u8; 32];
+        rng.fill_bytes(&mut key);
+        Self {
+            key,
+            head_padding: head,
+            tail_padding: tail,
+        }
+    }
+
+    /// Build the `EncryptKey` protobuf body.
+    pub fn encrypt_key_body(&self, token: i64) -> Vec<u8> {
+        crate::handshake::EncryptKey {
+            head_padding: self.head_padding.clone(),
+            key: self.key.clone(),
+            token,
+            tail_padding: self.tail_padding.clone(),
+        }
+        .encode_pb()
+    }
+
+    /// RSA-encrypt the body with the gate's PKCS#1 public key (DER).
+    /// Tries PKCS#1 v1.5 then OAEP(SHA-1), returning the ciphertext and the
+    /// scheme that produced it.
+    pub fn rsa_wrap(
+        &self,
+        gate_public_key_der: &[u8],
+        token: i64,
+    ) -> Result<(Vec<u8>, &'static str), GateError> {
+        let public_key = rsa::RsaPublicKey::from_pkcs1_der(gate_public_key_der).map_err(
+            |error| {
+                GateError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("bad gate public key: {error}"),
+                ))
+            },
+        )?;
+        let body = self.encrypt_key_body(token);
+        let mut rng = rand::thread_rng();
+        let scheme = std::env::var("APIIMO_RSA").unwrap_or_default();
+        if scheme == "oaep-sha1" {
+            let ct = public_key
+                .encrypt(&mut rng, rsa::Oaep::new::<sha1::Sha1>(), &body)
+                .map_err(|error| {
+                    GateError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("rsa oaep-sha1 encrypt failed: {error}"),
+                    ))
+                })?;
+            return Ok((ct, "oaep-sha1"));
+        }
+        let v15 = public_key
+            .encrypt(&mut rng, rsa::Pkcs1v15Encrypt, &body)
+            .map_err(|error| {
+                GateError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("rsa v1.5 encrypt failed: {error}"),
+                ))
+            })?;
+        Ok((v15, "pkcs1v15"))
+    }
+}
+
+/// Result of the key-exchange step.
+#[derive(Debug, Clone, Default)]
+pub struct HandshakeOutcome {
+    pub token: i64,
+    /// Raw bytes the server sent after our confirmEncryptKey — the ack is
+    /// already cipher-protected; kept verbatim for offline analysis.
+    pub post_confirm_frames: Vec<(bool, Vec<u8>)>,
+}
+
+impl GateConnection {
+    /// Read whatever raw bytes arrive within the timeout (for cipher
+    /// analysis of the encrypted phase, where framing is opaque).
+    pub fn read_raw(&mut self, timeout: Duration) -> Result<Vec<u8>, GateError> {
+        self.stream.set_read_timeout(Some(timeout))?;
+        let mut buf = vec![0u8; 4096];
+        match self.stream.read(&mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(buf)
+            }
+            Err(error) if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+            {
+                Ok(Vec::new())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Full anonymous handshake: request token, generate a session key,
+    /// RSA-wrap it with the gate public key, send confirmEncryptKey, then
+    /// collect the raw post-confirm server bytes. No account involved.
+    pub fn anonymous_handshake(
+        &mut self,
+        gate_public_key_der: &[u8],
+    ) -> Result<(HandshakeOutcome, SessionKeyMaterial), GateError> {
+        let probe = self.probe(8)?;
+        let token = probe
+            .encrypt_token
+            .ok_or_else(|| {
+                GateError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "gate did not issue an encrypt token",
+                ))
+            })?
+            .token;
+
+        let material = SessionKeyMaterial::generate();
+        let (ciphertext, _scheme) = material.rsa_wrap(gate_public_key_der, token)?;
+        let key_string =
+            crate::handshake::EncryptKeyString { key_string: ciphertext }.encode_pb();
+        self.write_frame(2, &key_string)?;
+
+        let mut outcome = HandshakeOutcome { token, ..Default::default() };
+        for _ in 0..4 {
+            let raw = self.read_raw(Duration::from_secs(3))?;
+            if raw.is_empty() {
+                break;
+            }
+            outcome.post_confirm_frames.push((true, raw));
+        }
+        Ok((outcome, material))
+    }
+}

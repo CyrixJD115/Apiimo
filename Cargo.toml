@@ -23,5 +23,8 @@ serde_json = "1"
 thiserror = "2"
 ruzstd = "0.7"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+sha1 = "0.10"
 rmp = "0.8"
 rmp-serde = "1"
+rsa = { version = "0.9", features = ["sha1"] }
+rand = "0.8"

@@ -110,6 +110,14 @@ where
             filter: args.get(2).cloned(),
             limit: 100,
         },
+        "gate-handshake" => {
+            let target = arg(1, "gate-handshake [host:port]")?;
+            let (host, port) = match target.rsplit_once(':') {
+                Some((h, p)) => (h.to_string(), p.parse().unwrap_or(10000)),
+                None => (target.to_string(), 10000),
+            };
+            Command::GateHandshake { host, port }
+        }
         "gate-probe" => {
             let target = arg(1, "gate-probe [host:port]")?;
             let (host, port) = match target.rsplit_once(':') {
@@ -264,6 +272,23 @@ pub fn render(output: &Output) -> String {
             }
             let _ = writeln!(text, "-- {} entries", entries.len());
         }
+        Output::GateHandshakeResult {
+            host,
+            token,
+            key_hex,
+            frames,
+        } => {
+            use std::fmt::Write;
+            let _ = writeln!(text, "gate {host} anonymous handshake:");
+            let _ = writeln!(text, "  token          : {token} ({token:#x})");
+            let _ = writeln!(text, "  our session key: {key_hex}");
+            for frame in frames {
+                let _ = writeln!(text, "  frame {frame}");
+            }
+            if frames.is_empty() {
+                let _ = writeln!(text, "  (no server bytes after confirm — silent ack?)");
+            }
+        }
         Output::GateProbeResult {
             host,
             port,
@@ -330,7 +355,8 @@ pub fn usage() -> String {
          \x20 xdf <path> [filter]         list XDF container entries (LuaScripts.xdf)\n\
          \x20 lua-strings <path> <entry>  dump strings of a LuaJIT entry in an XDF\n\
          \x20 xdf-cat <path> <entry>      write one XDF entry's raw bytes to stdout\n\
-         \x20 gate-probe [host:port]       request an encrypt token from a gate\n\n\
+         \x20 gate-probe [host:port]       request an encrypt token from a gate\n\
+         \x20 gate-handshake [host:port]    anonymous session-key exchange\n\n\
          Options:\n\
          \x20 --out <dir>                 output directory (default: <game>/.dump)\n\
          \x20 --game <dir>                game root (default: APIIMO_GAME or auto-discovery)\n\

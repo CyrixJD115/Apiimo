@@ -31,6 +31,11 @@ use apiimo_core::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Lowercase hex encoding for raw byte output.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Result limits mirroring the Python tool's command defaults.
 pub mod limits {
     pub const CLASSES: usize = 100;
@@ -86,6 +91,9 @@ pub enum Command {
     /// Open a framed control connection to a gate and request an encrypt
     /// token (the unauthenticated pre-login request every client performs).
     GateProbe { host: String, port: u16 },
+    /// Full anonymous key exchange: token + our RSA-wrapped session key.
+    /// Saves the key material for offline cipher analysis.
+    GateHandshake { host: String, port: u16 },
 }
 
 impl Command {
@@ -157,6 +165,13 @@ pub enum Output {
     },
     /// Entries of an XDF container (name, sizes), filtered as requested.
     XdfEntries(Vec<apiimo_network::XdfEntry>),
+    /// Anonymous handshake outcome (token + raw post-confirm server bytes).
+    GateHandshakeResult {
+        host: String,
+        token: i64,
+        key_hex: String,
+        frames: Vec<String>,
+    },
     /// Result of probing one gate for an encrypt token.
     GateProbeResult {
         host: String,
@@ -350,6 +365,33 @@ impl Apiimo {
                 let mut xdf = apiimo_network::XdfContainer::open(container)?;
                 Ok(Output::XdfBytes(xdf.read(entry)?))
             }
+            Command::GateHandshake { host, port } => {
+                let key_der = std::fs::read(&self.gate_key_path()).map_err(|source| {
+                    ApiError::Io {
+                        path: self.gate_key_path(),
+                        source,
+                    }
+                })?;
+                let mut conn = apiimo_network::GateConnection::connect(
+                    host,
+                    *port,
+                    std::time::Duration::from_secs(8),
+                )
+                .map_err(|error| apiimo_network::NetworkError::Xdf(error.to_string()))?;
+                let (outcome, material) = conn
+                    .anonymous_handshake(&key_der)
+                    .map_err(|error| apiimo_network::NetworkError::Xdf(error.to_string()))?;
+                Ok(Output::GateHandshakeResult {
+                    host: host.clone(),
+                    token: outcome.token,
+                    key_hex: hex(&material.key),
+                    frames: outcome
+                        .post_confirm_frames
+                        .into_iter()
+                        .map(|(ours, bytes)| format!("{} {}", if ours { "C" } else { "S" }, hex(&bytes)))
+                        .collect(),
+                })
+            }
             Command::GateProbe { host, port } => {
                 let mut conn = apiimo_network::GateConnection::connect(
                     host,
@@ -427,6 +469,15 @@ impl Apiimo {
                 "no dumper candidate could be executed".into(),
             ))),
         )
+    }
+
+    /// Path of the extracted gate RSA public key (PKCS#1 DER).
+    fn gate_key_path(&self) -> PathBuf {
+        std::env::var("APIIMO_GATE_KEY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from("../.captures/gate_rsa/gate_rsa_2048.der")
+            })
     }
 
     fn dump_cs(&self) -> Result<PathBuf, ApiError> {
