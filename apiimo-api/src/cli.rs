@@ -110,6 +110,14 @@ where
             filter: args.get(2).cloned(),
             limit: 100,
         },
+        "gate-probe" => {
+            let target = arg(1, "gate-probe [host:port]")?;
+            let (host, port) = match target.rsplit_once(':') {
+                Some((h, p)) => (h.to_string(), p.parse().unwrap_or(10000)),
+                None => (target.to_string(), 10000),
+            };
+            Command::GateProbe { host, port }
+        }
         "xdf-cat" => Command::XdfCat {
             container: PathBuf::from(arg(1, "xdf-cat <path> <entry>")?),
             entry: arg(2, "xdf-cat <path> <entry>")?.to_string(),
@@ -256,6 +264,30 @@ pub fn render(output: &Output) -> String {
             }
             let _ = writeln!(text, "-- {} entries", entries.len());
         }
+        Output::GateProbeResult {
+            host,
+            port,
+            token,
+            gate_info,
+            other,
+        } => {
+            use std::fmt::Write;
+            let _ = writeln!(text, "gate {host}:{port}");
+            match token {
+                Some(token) => {
+                    let _ = writeln!(text, "  encrypt token : {token} ({token:#x})");
+                }
+                None => {
+                    let _ = writeln!(text, "  encrypt token : <none received>");
+                }
+            }
+            if let Some(info) = gate_info {
+                let _ = writeln!(text, "  gate info     : {info}");
+            }
+            for (method, size) in other {
+                let _ = writeln!(text, "  other frame   : method={method} bytes={size}");
+            }
+        }
         Output::XdfBytes(bytes) => {
             use std::io::Write;
             std::io::stdout().write_all(bytes).expect("stdout write");
@@ -297,7 +329,8 @@ pub fn usage() -> String {
          \x20 discover                    experimental: rediscover section layout\n\
          \x20 xdf <path> [filter]         list XDF container entries (LuaScripts.xdf)\n\
          \x20 lua-strings <path> <entry>  dump strings of a LuaJIT entry in an XDF\n\
-         \x20 xdf-cat <path> <entry>      write one XDF entry's raw bytes to stdout\n\n\
+         \x20 xdf-cat <path> <entry>      write one XDF entry's raw bytes to stdout\n\
+         \x20 gate-probe [host:port]       request an encrypt token from a gate\n\n\
          Options:\n\
          \x20 --out <dir>                 output directory (default: <game>/.dump)\n\
          \x20 --game <dir>                game root (default: APIIMO_GAME or auto-discovery)\n\

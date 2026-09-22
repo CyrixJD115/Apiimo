@@ -83,6 +83,9 @@ pub enum Command {
         container: std::path::PathBuf,
         entry: String,
     },
+    /// Open a framed control connection to a gate and request an encrypt
+    /// token (the unauthenticated pre-login request every client performs).
+    GateProbe { host: String, port: u16 },
 }
 
 impl Command {
@@ -154,6 +157,14 @@ pub enum Output {
     },
     /// Entries of an XDF container (name, sizes), filtered as requested.
     XdfEntries(Vec<apiimo_network::XdfEntry>),
+    /// Result of probing one gate for an encrypt token.
+    GateProbeResult {
+        host: String,
+        port: u16,
+        token: Option<i64>,
+        gate_info: Option<String>,
+        other: Vec<(u16, usize)>,
+    },
     /// Raw bytes of one XDF entry.
     XdfBytes(Vec<u8>),
     /// Printable constant strings of one LuaJIT entry, with the chunk's
@@ -338,6 +349,28 @@ impl Apiimo {
             Command::XdfCat { container, entry } => {
                 let mut xdf = apiimo_network::XdfContainer::open(container)?;
                 Ok(Output::XdfBytes(xdf.read(entry)?))
+            }
+            Command::GateProbe { host, port } => {
+                let mut conn = apiimo_network::GateConnection::connect(
+                    host,
+                    *port,
+                    std::time::Duration::from_secs(8),
+                )
+                .map_err(|error| apiimo_network::NetworkError::Xdf(error.to_string()))?;
+                let result = conn
+                    .probe(8)
+                    .map_err(|error| apiimo_network::NetworkError::Xdf(error.to_string()))?;
+                Ok(Output::GateProbeResult {
+                    host: host.clone(),
+                    port: *port,
+                    token: result.encrypt_token.as_ref().map(|t| t.token),
+                    gate_info: result.gate_info.as_ref().map(|g| format!("{g:?}")),
+                    other: result
+                        .other_frames
+                        .iter()
+                        .map(|f| (f.method, f.body.len()))
+                        .collect(),
+                })
             }
         }
     }

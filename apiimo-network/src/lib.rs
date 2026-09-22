@@ -23,6 +23,7 @@
 
 #![forbid(unsafe_code)]
 
+mod client;
 mod endpoints;
 mod gate;
 mod handshake;
@@ -31,6 +32,7 @@ mod lua;
 mod pb;
 mod rpc;
 
+pub use client::{GateConnection, GateError, GateFrame, GateProbeResult, read_frame, write_frame};
 pub use endpoints::{Endpoint, EndpointClass, EndpointEnvironment, ENDPOINTS};
 pub use gate::{ExternalAddr, LocalDir, ServerGroup, ServerListPublish};
 pub use handshake::{
