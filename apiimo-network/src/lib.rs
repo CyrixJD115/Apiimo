@@ -25,16 +25,54 @@
 
 mod endpoints;
 mod gate;
+mod handshake;
 mod identity;
 mod lua;
+mod pb;
+mod rpc;
 
 pub use endpoints::{Endpoint, EndpointClass, EndpointEnvironment, ENDPOINTS};
 pub use gate::{ExternalAddr, LocalDir, ServerGroup, ServerListPublish};
+pub use handshake::{
+    ConnectReqType, ConnectServerReq, ConnectServerResp, EncryptKey, EncryptKeyString,
+    EncryptToken, Heartbeat,
+};
+pub use handshake::connect_resp_type;
+pub use rpc::micro_protocol;
 pub use identity::{
-    Credentials, FpcUser, FpxSessionKey, FpxTicket, GateSession, LiveIdentity, LoginFlowState,
-    PlatformSessionKey, RoleInfo, ServerSelection, TicketInfo, TicketPayload,
+    decode_base64, Credentials, CsLoginRequest, CsLogoutRequest, FpcUser, FpxSessionKey, FpxTicket,
+    GateSession, LiveIdentity, LoginFlowState, PlatformSessionKey, RoleEntry, RoleInfo,
+    ServerSelection, TicketInfo, TicketPayload, VerifySdkRequest, VerifySdkResponse,
 };
 pub use lua::{LuaJitChunk, XdfContainer, XdfEntry};
+pub use pb::{decode as pb_decode, PbMessage, PbValue};
+pub use rpc::{
+    decode_params, encode_params, MsMetadata, MsRequest, MsResponse, ServiceMethod, SERVICE_METHODS,
+};
+
+/// The game's own protobuf schemas, vendored verbatim from
+/// `LuaScripts.xdf:xfs/luascripts/Core/Proto/` (package `phonest.proto`).
+pub const PROTO_FILES: &[(&str, &str)] = &[
+    ("agent.proto", include_str!("../proto/agent.proto")),
+    (
+        "client_gate.proto",
+        include_str!("../proto/client_gate.proto"),
+    ),
+    ("common.proto", include_str!("../proto/common.proto")),
+    (
+        "common_service.proto",
+        include_str!("../proto/common_service.proto"),
+    ),
+    (
+        "game_dbmanager.proto",
+        include_str!("../proto/game_dbmanager.proto"),
+    ),
+    ("gate_game.proto", include_str!("../proto/gate_game.proto")),
+    (
+        "gate_service.proto",
+        include_str!("../proto/gate_service.proto"),
+    ),
+];
 
 /// Errors surfaced by the network crate.
 #[derive(Debug, thiserror::Error)]

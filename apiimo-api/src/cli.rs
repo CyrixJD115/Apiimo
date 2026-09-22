@@ -110,6 +110,10 @@ where
             filter: args.get(2).cloned(),
             limit: 100,
         },
+        "xdf-cat" => Command::XdfCat {
+            container: PathBuf::from(arg(1, "xdf-cat <path> <entry>")?),
+            entry: arg(2, "xdf-cat <path> <entry>")?.to_string(),
+        },
         "lua-strings" => Command::XdfStrings {
             container: PathBuf::from(arg(1, "lua-strings <path> <entry>")?),
             entry: arg(2, "lua-strings <path> <entry>")?.to_string(),
@@ -252,6 +256,10 @@ pub fn render(output: &Output) -> String {
             }
             let _ = writeln!(text, "-- {} entries", entries.len());
         }
+        Output::XdfBytes(bytes) => {
+            use std::io::Write;
+            std::io::stdout().write_all(bytes).expect("stdout write");
+        }
         Output::LuaStrings {
             chunk_name,
             version,
@@ -288,7 +296,8 @@ pub fn usage() -> String {
          \x20 patch <va_hex> <hexbytes>   patch GameAssembly.dll in place\n\
          \x20 discover                    experimental: rediscover section layout\n\
          \x20 xdf <path> [filter]         list XDF container entries (LuaScripts.xdf)\n\
-         \x20 lua-strings <path> <entry>  dump strings of a LuaJIT entry in an XDF\n\n\
+         \x20 lua-strings <path> <entry>  dump strings of a LuaJIT entry in an XDF\n\
+         \x20 xdf-cat <path> <entry>      write one XDF entry's raw bytes to stdout\n\n\
          Options:\n\
          \x20 --out <dir>                 output directory (default: <game>/.dump)\n\
          \x20 --game <dir>                game root (default: APIIMO_GAME or auto-discovery)\n\

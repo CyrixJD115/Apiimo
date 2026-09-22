@@ -77,6 +77,12 @@ pub enum Command {
         entry: String,
         limit: usize,
     },
+    /// Write one XDF entry's raw bytes to stdout (extract .proto/.lua
+    /// files verbatim).
+    XdfCat {
+        container: std::path::PathBuf,
+        entry: String,
+    },
 }
 
 impl Command {
@@ -148,6 +154,8 @@ pub enum Output {
     },
     /// Entries of an XDF container (name, sizes), filtered as requested.
     XdfEntries(Vec<apiimo_network::XdfEntry>),
+    /// Raw bytes of one XDF entry.
+    XdfBytes(Vec<u8>),
     /// Printable constant strings of one LuaJIT entry, with the chunk's
     /// provenance header line first.
     LuaStrings {
@@ -326,6 +334,10 @@ impl Apiimo {
                     version: chunk.version,
                     strings: chunk.strings.into_iter().take(*limit).collect(),
                 })
+            }
+            Command::XdfCat { container, entry } => {
+                let mut xdf = apiimo_network::XdfContainer::open(container)?;
+                Ok(Output::XdfBytes(xdf.read(entry)?))
             }
         }
     }

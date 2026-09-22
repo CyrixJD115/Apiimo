@@ -13,7 +13,7 @@ third of the time.
 |---|---|
 | `apiimo-crypto` | The embedded 1152-byte repeating-XOR keystream, body decryption, and the statistical key-recovery fallback for new builds. No I/O; pure buffer routines. |
 | `apiimo-core` | The hub: metadata rebuilding (vanilla v31 header + verified section layout), default-value sanitization, PE VA/file-offset helpers, binary patching, dump orchestration, and post-dump queries. Routes its crypto needs through `apiimo-crypto`. |
-| `apiimo-network` | Login/session protocol model (FpcUser, Credentials, GateSession), endpoint registry from the dump, and XDF/LuaJIT container tooling (`apiimo xdf` / `apiimo lua-strings`). |
+| `apiimo-network` | The decoded gate/login protocol: vendored `phonest.proto` schemas, protobuf wire codec, MsRequest RPC envelope (msgpack/base64), gate handshake types, credential parsers, endpoint registry, and XDF/LuaJIT tooling (`apiimo xdf` / `lua-strings` / `xdf-cat`). |
 | `apiimo-api` | The boundary layer: the `apiimo` CLI binary plus a library API (`Command`/`Output` enums, serde-serializable) for AniiStudio to drive through `ans-apiimo`. |
 
 Layering: `apiimo-api` -> `apiimo-core` -> `apiimo-crypto`, with
@@ -107,6 +107,25 @@ carries the gates, OSS buckets, payment services, and the public
 `server_list_publish.json` CDN; `ServerListPublish` parses that document,
 and `FpxTicket`/`FpxSessionKey`/`LiveIdentity` decode the observed
 credential structures (including the roleId "Class" prefix encoding).
+
+## Protocol layer (`apiimo-network`)
+
+The gate protocol is fully decoded and implemented as library types —
+the game's own `.proto` schemas are vendored under `apiimo-network/proto/`
+(extracted verbatim from `LuaScripts.xdf`, package `phonest.proto`):
+
+- `pb` — minimal protobuf wire codec (varint/bytes/nested, tolerant decode)
+- `handshake` — EncryptToken/EncryptKey/ConnectServerReq/Resp/Heartbeat
+- `rpc` — MsRequest/MsResponse (protocol 33), the `POST /rpc` JSON
+  envelope with base64-msgpack params, and the known service-method
+  registry (`LoginService.verifySdk`, `RoleService.CS_Login`,
+  `KvService.kvServiceFind`, ...)
+- `identity` — FpxTicket/FpxSessionKey parsers and the
+  `VerifySdkRequest/Response`, `CsLoginRequest/CsLogoutRequest` contracts
+
+A full login replay additionally needs the gate TCP framing and the RSA
+public key source (see `tools/lua-disasm/` for the disassembly toolchain
+used to recover all of this).
 
 ## Library use
 

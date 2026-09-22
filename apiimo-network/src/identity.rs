@@ -63,19 +63,6 @@ pub struct Credentials {
     pub track_info: Option<String>,
 }
 
-/// One entry of `roleInfo.players` from the login-service response.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RoleInfo {
-    #[serde(rename = "roleId", alias = "id")]
-    pub role_id: String,
-    #[serde(rename = "roleName", alias = "name")]
-    pub role_name: Option<String>,
-    #[serde(rename = "serverId")]
-    pub server_id: Option<String>,
-    #[serde(rename = "level", alias = "lv")]
-    pub level: Option<i64>,
-}
-
 /// The server a player is bound to, as cached by `LoginServerComponent.lua`
 /// under `OVERSEA_SERVER_ID_KEY_FORMAT` keyed by accountId.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,8 +139,35 @@ fn default_true() -> bool {
 // Live-credential structures (observed in fpxui.log, 2026-09-21)
 // ---------------------------------------------------------------------------
 
+/// Standard-alphabet base64 encoder (with padding).
+pub fn encode_base64(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// Minimal standard-alphabet base64 decoder (padding-optional).
-pub(crate) fn decode_base64(input: &str) -> Result<Vec<u8>, NetworkError> {
+pub fn decode_base64(input: &str) -> Result<Vec<u8>, NetworkError> {
     const INVALID: u8 = 0xFF;
     fn value(byte: u8) -> u8 {
         match byte {
@@ -425,5 +439,130 @@ mod credential_tests {
             ..Default::default()
         };
         assert_eq!(identity.role_class(), "3020011");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Login service contracts (LoginAgent.lua disassembly)
+// ---------------------------------------------------------------------------
+
+/// Params for `LoginService.verifySdk` (msgpack-encoded into
+/// `MsRequest.params`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VerifySdkRequest {
+    /// The FPX ticket blob (`sdkManager:getTicket()`).
+    #[serde(rename = "sdkInfo")]
+    pub sdk_info: String,
+    #[serde(rename = "needCheck", default)]
+    pub need_check: bool,
+}
+
+/// Response payload of `LoginService.verifySdk` (decoded from
+/// `MsResponse.params`); field names exactly as the client reads them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct VerifySdkResponse {
+    #[serde(default, rename = "status", alias = "Status")]
+    pub status: Option<i64>,
+    /// The world-gate auth token ("Token" in the Lua).
+    #[serde(default, rename = "Token")]
+    pub token: Option<String>,
+    #[serde(default, rename = "GlobalGateSessionId")]
+    pub global_gate_session_id: Option<String>,
+    #[serde(default, rename = "GlobalGateId")]
+    pub global_gate_id: Option<String>,
+    #[serde(default, rename = "ServerId", alias = "serverId")]
+    pub server_id: Option<String>,
+    /// `roleInfo.players` — the account's characters.
+    #[serde(default, rename = "RoleInfo")]
+    pub role_info: Option<RoleInfo>,
+    #[serde(default, rename = "errmsg")]
+    pub errmsg: Option<String>,
+}
+
+/// `RoleInfo { players: [RoleEntry] }`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RoleInfo {
+    #[serde(default)]
+    pub players: Vec<RoleEntry>,
+}
+
+/// One entry of `roleInfo.players`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RoleEntry {
+    #[serde(default, rename = "roleId", alias = "id")]
+    pub role_id: String,
+    #[serde(default, rename = "roleName", alias = "name")]
+    pub role_name: Option<String>,
+    #[serde(default, rename = "level", alias = "lv")]
+    pub level: Option<i64>,
+}
+
+/// Params for `RoleService.CS_Login`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CsLoginRequest {
+    #[serde(rename = "token")]
+    pub token: String,
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "gateId")]
+    pub gate_id: String,
+    #[serde(rename = "serverId")]
+    pub server_id: String,
+    #[serde(rename = "clientVersion")]
+    pub client_version: String,
+}
+
+/// Params for `RoleService.CS_Logout`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CsLogoutRequest {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "gateId")]
+    pub gate_id: String,
+    #[serde(rename = "serverId")]
+    pub server_id: String,
+    #[serde(rename = "UserName")]
+    pub user_name: String,
+    #[serde(rename = "token")]
+    pub token: String,
+}
+
+#[cfg(test)]
+mod login_contract_tests {
+    use super::*;
+
+    #[test]
+    fn verify_sdk_response_parses_client_field_names() {
+        let payload = serde_json::json!({
+            "status": 1,
+            "Token": "tok_abc",
+            "GlobalGateSessionId": "ggs_1",
+            "GlobalGateId": "gg_2",
+            "ServerId": "3",
+            "RoleInfo": { "players": [ { "roleId": "302001142689", "level": 13 } ] }
+        });
+        let response: VerifySdkResponse = serde_json::from_value(payload).unwrap();
+        assert_eq!(response.token.as_deref(), Some("tok_abc"));
+        assert_eq!(response.global_gate_session_id.as_deref(), Some("ggs_1"));
+        assert_eq!(
+            response.role_info.unwrap().players[0].role_id,
+            "302001142689"
+        );
+    }
+
+    #[test]
+    fn login_request_round_trips_through_msgpack() {
+        let request = CsLoginRequest {
+            token: "t".into(),
+            session_id: "s".into(),
+            gate_id: "g".into(),
+            server_id: "3".into(),
+            client_version: "1.0.3551601".into(),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        let packed = crate::rpc::encode_params(&value);
+        let back: serde_json::Value = crate::rpc::decode_params(&packed).unwrap();
+        assert_eq!(back["serverId"], "3");
+        assert_eq!(back["clientVersion"], "1.0.3551601");
     }
 }
