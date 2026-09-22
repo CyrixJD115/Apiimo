@@ -366,7 +366,7 @@ impl Apiimo {
                 Ok(Output::XdfBytes(xdf.read(entry)?))
             }
             Command::GateHandshake { host, port } => {
-                let key_der = std::fs::read(&self.gate_key_path()).map_err(|source| {
+                let key_der = std::fs::read(self.gate_key_path()).map_err(|source| {
                     ApiError::Io {
                         path: self.gate_key_path(),
                         source,

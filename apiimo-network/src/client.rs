@@ -185,7 +185,7 @@ mod tests {
 
 use rand::RngCore;
 use rsa::pkcs1::DecodeRsaPublicKey;
-use rsa::traits::PublicKeyParts;
+
 
 /// The session-key material we generate and hand to the gate, encrypted
 /// with the gate's RSA public key. Structure per `EncryptKey` in
@@ -310,8 +310,7 @@ impl GateConnection {
         let token = probe
             .encrypt_token
             .ok_or_else(|| {
-                GateError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                GateError::Io(std::io::Error::other(
                     "gate did not issue an encrypt token",
                 ))
             })?
