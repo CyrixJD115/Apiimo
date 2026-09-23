@@ -8,6 +8,10 @@ use apiimo_api::{parse, render, usage, Apiimo};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+        println!("apiimo {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     let json = args.iter().any(|arg| arg == "--json");
     let args: Vec<String> = args.into_iter().filter(|arg| arg != "--json").collect();
 

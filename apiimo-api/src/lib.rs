@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use apiimo_core::{
     default_game_dir, find_addresses, find_classes, find_fields, find_methods, find_strings,
     load_script, output_path, run_dump, AddressMatch, ClassMatch, DumpReport, DumpOptions,
-    MethodMatch, PeImage, StringLiteralMatch, TYPES_IN_BINARY,
+    MethodMatch, PeImage, StringLiteralMatch,
 };
 use serde::{Deserialize, Serialize};
 
@@ -42,7 +42,7 @@ pub(crate) fn decode_hex(s: &str) -> Result<Vec<u8>, std::num::ParseIntError> {
     let s = s.trim();
     if s.len() % 2 != 0 {
         // pad a leading nibble so "abc" still parses deterministically
-        return Ok(decode_hex(&format!("0{s}"))?);
+        return decode_hex(&format!("0{s}"));
     }
     (0..s.len())
         .step_by(2)
@@ -262,7 +262,6 @@ pub struct Apiimo {
     output_dir: Option<PathBuf>,
     /// Explicit dumper override; `None` selects the embedded-then-PATH chain.
     dumper_command: Option<PathBuf>,
-    types_count: u32,
 }
 
 impl Apiimo {
@@ -273,7 +272,6 @@ impl Apiimo {
             game_dir: default_game_dir(),
             output_dir: None,
             dumper_command: None,
-            types_count: TYPES_IN_BINARY,
         }
     }
 
@@ -283,7 +281,6 @@ impl Apiimo {
             game_dir: game_dir.into(),
             output_dir: None,
             dumper_command: None,
-            types_count: TYPES_IN_BINARY,
         }
     }
 
@@ -307,11 +304,6 @@ impl Apiimo {
 
     /// Override the MetadataRegistration type count used when sanitizing
     /// default values (relevant when a game update changes the binary).
-    pub fn set_types_count(&mut self, count: u32) -> &mut Self {
-        self.types_count = count;
-        self
-    }
-
     /// Execute one command against the configured game root.
     pub fn run(&self, command: &Command) -> Result<Output, ApiError> {
         match command {
@@ -670,7 +662,6 @@ impl Apiimo {
             let mut options = DumpOptions::new(&self.game_dir);
             options.output_dir = self.output_dir.clone();
             options.dumper_command = dumper.clone().into();
-            options.types_count = self.types_count;
             match run_dump(&options) {
                 Ok(report) if report.dumper_succeeded => {
                     return Ok(Output::Dump(Box::new(report)));

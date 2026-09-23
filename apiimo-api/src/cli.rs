@@ -7,6 +7,7 @@
 //! just like the Python entry point. [`render`] turns an [`Output`](crate::Output)
 //! into the human-readable text the Python tool printed.
 
+use apiimo_network::ENDPOINTS;
 use std::path::PathBuf;
 
 use crate::{Command, Output};
@@ -80,6 +81,11 @@ where
         return Ok(invocation);
     }
 
+    if matches!(args[0].as_str(), "help" | "-h" | "--help" | "?") {
+        invocation.help_only = true;
+        return Ok(invocation);
+    }
+
     let name = args[0].as_str();
     let arg = |index: usize, what: &'static str| -> Result<&str, CliError> {
         args.get(index)
@@ -111,7 +117,10 @@ where
             limit: 100,
         },
         "gate-handshake" => {
-            let target = arg(1, "gate-handshake [host:port]")?;
+            let target = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(default_gate_target);
             let (host, port) = match target.rsplit_once(':') {
                 Some((h, p)) => (h.to_string(), p.parse().unwrap_or(10000)),
                 None => (target.to_string(), 10000),
@@ -119,7 +128,10 @@ where
             Command::GateHandshake { host, port }
         }
         "gate-probe" => {
-            let target = arg(1, "gate-probe [host:port]")?;
+            let target = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(default_gate_target);
             let (host, port) = match target.rsplit_once(':') {
                 Some((h, p)) => (h.to_string(), p.parse().unwrap_or(10000)),
                 None => (target.to_string(), 10000),
@@ -152,6 +164,23 @@ where
         other => return Err(CliError::UnknownCommand(other.to_string())),
     };
     Ok(invocation)
+}
+
+/// First production game gate from the endpoint registry: the target used
+/// when gate-probe/gate-handshake run without an explicit host:port.
+fn default_gate_target() -> String {
+    use apiimo_network::{EndpointClass, EndpointEnvironment};
+    ENDPOINTS
+        .iter()
+        .find(|endpoint| {
+            endpoint.class == EndpointClass::GameGate
+                && endpoint.environment == EndpointEnvironment::Production
+        })
+        .map(|endpoint| match endpoint.port {
+            Some(port) => format!("{}:{}", endpoint.host, port),
+            None => endpoint.host.to_string(),
+        })
+        .expect("the endpoint registry lists at least one production game gate")
 }
 
 /// Accept `0x`-prefixed or bare hexadecimal like Python's `int(value, 16)`.
@@ -359,7 +388,7 @@ pub fn render(output: &Output) -> String {
         }
         Output::GateStatusTable { entries } => {
             use std::fmt::Write;
-            let _ = writeln!(text, "{:<46} {:<26} {}", "gate", "status", "detail");
+            let _ = writeln!(text, "{:<46} {:<26} detail", "gate", "status");
             for e in entries {
                 let _ = writeln!(
                     text,
@@ -396,38 +425,96 @@ pub fn render(output: &Output) -> String {
 
 /// Usage text mirroring the Python tool's module docstring.
 pub fn usage() -> String {
-    String::from(
-        "Apiimo - Aniimo (Unity IL2CPP) reverse engineering toolkit.\n\n\
-         Commands:\n\
-         \x20 dump                        full pipeline -> <out> (default: <game>/.dump)\n\
-         \x20 classes <regex>             list matching classes\n\
-         \x20 methods <regex>             list matching methods with VA\n\
-         \x20 fields <ClassRegex>         dump a class layout (fields + offsets)\n\
-         \x20 addr <SubStr>               resolve method addresses from script.json\n\
-         \x20 str <regex>                 search string literals\n\
-         \x20 va2off <va_hex>             GameAssembly.dll VA -> file offset\n\
-         \x20 off2va <off_hex>            file offset -> VA\n\
-         \x20 patch <va_hex> <hexbytes>   patch GameAssembly.dll in place\n\
-         \x20 discover                    experimental: rediscover section layout\n\
-         \x20 xdf <path> [filter]         list XDF container entries (LuaScripts.xdf)\n\
-         \x20 lua-strings <path> <entry>  dump strings of a LuaJIT entry in an XDF\n\
-         \x20 xdf-cat <path> <entry>      write one XDF entry's raw bytes to stdout\n\
-         \x20 gate-probe [host:port]       request an encrypt token from a gate\n\
-         \x20 gate-handshake [host:port]    anonymous session-key exchange\n\
-         \x20 save-pull <uid> [out]        download your client-info save blob\n\
-         \x20 gate-decrypt <hex> <in> <out> RC4-decode a captured gate stream\n\
-         \x20 gate-status                   probe all known gates for up/maintenance\n\n\
-         Options:\n\
-         \x20 --out <dir>                 output directory (default: <game>/.dump)\n\
-         \x20 --game <dir>                game root (default: APIIMO_GAME or auto-discovery)\n\
-         \x20 --dumper <path>             Il2CppDumper executable (default: il2cpp-dumper on PATH)\n\
-         \x20 --json                      print structured JSON instead of text\n",
-    )
+    r#"Apiimo - Aniimo (Unity IL2CPP) reverse engineering toolkit.
+
+The game folder is auto-discovered; point elsewhere with --game or $APIIMO_GAME.
+Append --json to any command for machine-readable output.
+
+Most used:
+  dump                           one shot: decrypt global-metadata, rebuild it,
+                                 and run the dumper (dump.cs, script.json, DummyDlls)
+  discover                       show where every metadata section sits in the
+                                 current build - nothing is hardcoded
+  gate-status                    check every login gate: online / maintenance / down
+
+Search the dump:
+  classes <regex>                list classes whose name matches a pattern
+  methods <regex>                list methods matching a pattern, with addresses
+  fields <ClassRegex>            show one class's fields and their offsets
+  addr <SubStr>                  look up a method's runtime address from script.json
+  str <regex>                    search the game's string literals
+
+Addresses & patching (GameAssembly.dll):
+  va2off <va_hex>                virtual address -> file offset
+  off2va <off_hex>               file offset -> virtual address
+  patch <va_hex> <hexbytes>      write raw bytes into the game binary, in place
+
+Game data (Lua scripts):
+  xdf <path> [filter]            list entries in a .xdf data pack (LuaScripts.xdf)
+  lua-strings <path> <entry>     readable strings from one LuaJIT entry
+  xdf-cat <path> <entry>         write one entry's raw bytes to stdout
+
+Network (login gates & saves):
+  gate-probe [host:port]         request an encryption token from one gate
+  gate-handshake [host:port]     anonymous session-key exchange with a gate
+  save-pull <uid> [out]          download an account's client-info save blob
+  gate-decrypt <key_hex> <in> <out>  decrypt a captured gate stream with an RC4 key
+
+Options:
+  --game <dir>                   game root (default: $APIIMO_GAME or auto-discovery)
+  --out <dir>                    dump output directory (default: <game>/.dump)
+  --dumper <path>                dumper executable or .dll (default: bundled fork)
+  --json                         print JSON instead of text
+  -h, --help                     show this help
+  -V, --version                  print the apiimo version
+
+Examples:
+  apiimo dump                              dump the auto-found game
+  APIIMO_GAME=./.Aniimo_Steam apiimo dump  dump a specific game folder
+  apiimo classes XCloudPipe                which classes match a name?
+  apiimo addr XCloudPipeController         where do its methods live?
+  apiimo gate-status                       are the login gates up?
+  apiimo save-pull <your-uid>              pull your own save blob
+"#
+    .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_flags_trigger_help_only() {
+        for flag in ["help", "-h", "--help", "?"] {
+            let invocation = parse([flag]).unwrap();
+            assert!(invocation.help_only, "{flag} should show help");
+        }
+    }
+
+    #[test]
+    fn usage_is_grouped_and_covers_every_command() {
+        let text = usage();
+        for section in [
+            "Most used:",
+            "Search the dump:",
+            "Addresses & patching",
+            "Game data (Lua scripts):",
+            "Network (login gates & saves):",
+            "Options:",
+            "Examples:",
+        ] {
+            assert!(text.contains(section), "usage is missing section {section:?}");
+        }
+        for command in [
+            "dump", "discover", "classes", "methods", "fields", "addr", "str", "va2off",
+            "off2va", "patch", "xdf", "lua-strings", "xdf-cat", "gate-probe",
+            "gate-handshake", "save-pull", "gate-decrypt", "gate-status", "--game", "--out",
+            "--dumper", "--json",
+        ] {
+            assert!(text.contains(command), "usage is missing {command:?}");
+        }
+    }
+
 
     #[test]
     fn parses_python_style_invocations() {
