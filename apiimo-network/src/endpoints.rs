@@ -530,6 +530,103 @@ pub const ENDPOINTS: &[Endpoint] = &[
         "/server_list/server_list_publish.json",
         "server list (backup CDN)",
     ),
+    // -- office API public CMS surface (recovered from the official website's
+    //    NUXT chunks, verified live 2026-09-22; Region header = locale) --
+    Endpoint::new(
+        "https://worldx-office-api.aniimo.com",
+        "/api/subscribe/appoint",
+        "global pre-registration counter (no auth): {current_count}",
+        EndpointEnvironment::Production,
+        EndpointClass::GameApi,
+    ),
+    Endpoint::new(
+        "https://worldx-office-api.aniimo.com",
+        "/api/idle/info?region={locale}",
+        "website feature-carousel CMS records",
+        EndpointEnvironment::Production,
+        EndpointClass::GameApi,
+    ),
+    Endpoint::new(
+        "https://worldx-office-api.aniimo.com",
+        "/api/bg/video?region={locale}",
+        "website background video/poster CMS",
+        EndpointEnvironment::Production,
+        EndpointClass::GameApi,
+    ),
+    Endpoint::new(
+        "https://worldx-office-api.aniimo.com",
+        "/api/share/site?position={pos}",
+        "website share-site links",
+        EndpointEnvironment::Production,
+        EndpointClass::GameApi,
+    ),
+    Endpoint::new(
+        "https://worldx-office-api.aniimo.com",
+        "/api/agreement/list?region={locale}",
+        "website footer agreements",
+        EndpointEnvironment::Production,
+        EndpointClass::GameApi,
+    ),
+    Endpoint::new(
+        "https://worldx-office-api.aniimo.com",
+        "/api/player/login",
+        "website account login (credentials required)",
+        EndpointEnvironment::Production,
+        EndpointClass::GameApi,
+    ),
+    // -- website / web-store CDNs and fronts (2026-09-22 crawl) --
+    Endpoint::new(
+        "https://worldx-website-cdn.aniimo.com",
+        "/official-website/worldx-global-stage/office/aniimo/{file}",
+        "website media CDN (OSS bucket worldx-website; listing denied)",
+        EndpointEnvironment::Production,
+        EndpointClass::ContentDelivery,
+    ),
+    Endpoint::new(
+        "https://kg-web-cdn.akamaized.net",
+        "/master/official-website/worldx_office_frontend/_nuxt/{chunk}.js",
+        "official-website JS chunks (KingsGroup web CDN, Akamai)",
+        EndpointEnvironment::Production,
+        EndpointClass::ContentDelivery,
+    ),
+    Endpoint::new(
+        "https://store.aniimo.com",
+        "/aniimo/pc-checkout/",
+        "PC web checkout (web-pay-hub SPA)",
+        EndpointEnvironment::Production,
+        EndpointClass::Payment,
+    ),
+    Endpoint::new(
+        "https://worldx-store.funplus.com",
+        "/aniimo/sdk/",
+        "in-game SDK store page (web-pay-hub SPA)",
+        EndpointEnvironment::Production,
+        EndpointClass::Payment,
+    ),
+    // -- cluster ms-gates at :26000 and master gates (server list 2026-09-22;
+    //    the :26000 cluster gates and ap/eu masters answer probes and issue
+    //    tokens + m19 gate-info even while the close gates are FORBIDDEN) --
+    gate("47.254.146.32", 26000, "Russia cluster ms-gate"),
+    gate("47.253.51.106", 26000, "SHH cluster ms-gate"),
+    gate("47.252.31.70", 26000, "Review-Global cluster ms-gate"),
+    gate("47.236.60.219", 26000, "CONSOLE-Review cluster ms-gate"),
+    gate("47.236.102.145", 26000, "VN cluster ms-gate"),
+    gate("47.236.82.169", 26000, "Pioneer cluster ms-gate (refused 2026-09-22)"),
+    gate(
+        "worldx-ap-master-ms-gate.kingsgroupgames.com",
+        10000,
+        "AP master ms-gate",
+    ),
+    gate(
+        "worldx-eu-master-ms-gate.kingsgroupgames.com",
+        10000,
+        "EU master ms-gate",
+    ),
+    gate(
+        "172.65.184.138",
+        10000,
+        "Aniimo-OST test cluster ms-gate (FORBID when probed)",
+    ),
     // -- per-player object storage (presigned OSS4 URLs, 300s expiry) --
     oss(
         "https://worldx-global-assets.oss-us-east-1.aliyuncs.com",
