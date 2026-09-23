@@ -1,8 +1,13 @@
 //! Cryptographic primitives used by the Apiimo metadata pipeline.
 //!
-//! The current Aniimo build uses a repeating XOR keystream over the metadata
-//! body. These routines deliberately contain no file-system or process logic;
-//! callers can use them with buffers, test fixtures, or game files.
+//! Each Aniimo build ships a repeating XOR keystream over the metadata body;
+//! the keystreams recovered for known builds are embedded here and selected
+//! automatically. For a fresh update whose keystream is not yet embedded,
+//! [`recover_key_refined`] produces a new key from the ciphertext alone:
+//! a statistical seed pass followed by a refinement guided by the string
+//! byte distribution of known builds. These routines deliberately contain
+//! no file-system or process logic; callers can use them with buffers,
+//! test fixtures, or game files.
 
 use std::fmt;
 use std::sync::OnceLock;
@@ -16,46 +21,224 @@ pub const KEY_PERIOD: usize = 1152;
 /// Number of unencrypted header bytes at the beginning of the file.
 pub const HEADER_SIZE: usize = 256;
 
-const EMBEDDED_KEY_HEX: &str = concat!(
-    "88de9c85c7d93fa45b28b226ae54754f99f8d10ee344fe1baf0753a0cec6b212",
-    "414a80d57cca3de5f3c2ad7ece704181858814713867ac57972ab67f9e05fe1a",
-    "6a8a71d2237a9e4ac099c59911615c01f91cf20e77e6a77ffbe391e90e59d8d0",
-    "0544f0c0686230054becf9281203ab3fc5f69cb30838cf50476faa5a511ce741",
-    "96de9c85d8d93fa4f0c97b13135a645a0e30c3c1708cc148558eb58749acb22a",
-    "1367e9876009a5c2c30449525b9188b43a860564adafbe987a082f01628c183d",
-    "3ae4f2d2a6537420bab0fb93faa33b15b4d35416b20210471febc91e3f552e83",
-    "fbcd16e742e61528b82fb56fd4ee5c3554de5d8a47f76948264fd46266103c8e",
-    "0716a3d62450d983f0c97b13135a645a0e30c3c1708cc148558eb58749acb22a",
-    "1367e9876009a5c2c30449525b9188b43a860564adafbe987a082f01628c183d",
-    "3ae4f2d2a6537420bab0fb93faa33b15b4d35416b20210471febc91e3f552e83",
-    "fbcd16e742e61528b82fb56fd4ee5c3554de5d8a47f76948264fd46266103c8e",
-    "0716a3d62450d9835b28b226ae54754f99f8d10ee344fe1baf0753a0cec6b212",
-    "414a80d57cca3de5f3c2ad7ece704181858814713867ac57972ab67f9e05fe1a",
-    "6a8a71d2237a9e4ac099c59911615c01f91cf20e77e6a77ffbe391e90e59d8d0",
-    "0544f0c0686230054becf9281203ab3fc5f69cb30838cf50476faa5a511ce741",
-    "96de9c85d8d93fa45b28b226ae54754f99f8d10ee344fe1baf0753a0cec6b212",
-    "414a80d57cca3de5f3c2ad7ece704181858814713867ac57972ab67f9e05fe1a",
-    "6a8a71d2237a9e4ac099c59911615c01f91cf20e77e6a77ffbe391e90e59d8d0",
-    "0544f0c0686230054becf9281203ab3fc5f69cb30838cf50476faa5a511ce741",
-    "96de9c85d8d93fa4f0c97b13135a645a0e30c3c1708cc148558eb58749acb22a",
-    "1367e9876009a5c2c30449525b9188b43a860564adafbe987a082f01628c183d",
-    "3ae4f2d2a6537420bab0fb93faa33b15b4d35416b20210471febc91e3f552e83",
-    "fbcd16e742e61528b82fb56fd4ee5c3554de5d8a47f76948264fd46266103c8e",
-    "0716a3d62450d9835b28b226ae54754f99f8d10e4180371b02e976b51bc2312a",
-    "eca4a5c0d12418f08402e746ce704181858814713867ac574d04d95233ebdb0f",
-    "6a8a71d25b903867159d46a1b3a5950123329d230f0c01528c23dbd10e59d8d0",
-    "a8aad5d5108896284becf92865c3e1071fd8f39ed216a07d9d41c577f3d82e41",
-    "341a558575371ab1f0c97b13135a645a0e30c3c1708cc148558eb58749acb22a",
-    "1367e9876009a5c2c30449525b9188b43a860564adafbe987a082f01628c183d",
-    "3ae4f2d2a6537420bab0fb93faa33b15b4d35416b20210471febc91e3f552e83",
-    "fbcd16e742e61528b82fb56fd4ee5c3554de5d8a47f76948264fd46266103c8e",
-    "0716a3d62450d9835b28b226af54754f9bf8d10ee044fe1bab0753a0cbc6b212",
-    "474a80d57bca3de5fbc2ad7ec77041818f8814713367ac579b2ab67f9305fe1a",
-    "648a71d22c7a9e4ad099c59900615c01eb1cf20e64e6a77fefe391e91b59d8d0",
-    "1344f0c07f62300553ecf9280b03ab3fdff69cb31338cf505b6faa5a4c1ce741",
-);
+/// Byte histogram over the string sections (stringLiteralData plus string
+/// heaps) of both known builds, 14,131,366 bytes total. Smoothing happens at
+/// use time; only the raw counts are stored.
+const STRING_PRIOR_COUNTS: [u32; 256] = [
+    491213, 490, 116, 50, 106, 36, 54, 42, 26, 172, 3160, 32,
+    30, 2224, 32, 32, 36, 34, 42, 42, 26, 28, 16, 24,
+    42, 26, 24, 26, 36, 40, 78, 20, 189361, 3967, 5450, 606,
+    1784, 242, 312, 10405, 2988, 2876, 380, 484, 9654, 169547, 52868, 14210,
+    78352, 33604, 29299, 19354, 15643, 15123, 12960, 10275, 12014, 11798, 10436, 598,
+    19485, 5159, 19680, 478, 430, 131456, 96828, 195928, 140699, 109681, 128519, 101014,
+    43464, 158448, 5184, 18833, 91338, 115059, 59950, 72649, 209698, 4911, 122678, 225525,
+    143317, 78797, 58455, 70991, 78931, 8787, 7175, 6157, 948, 6117, 182, 356410,
+    2232, 858643, 120384, 320772, 396695, 1395210, 140958, 239808, 171560, 657605, 13775, 82576,
+    584025, 271173, 706255, 712298, 266835, 10505, 736196, 560606, 907935, 341148, 91173, 58881,
+    86175, 164516, 24116, 16984, 922, 17000, 46, 16, 2067, 736, 646, 496,
+    873, 900, 616, 759, 1002, 742, 619, 478, 1080, 877, 460, 609,
+    1233, 416, 298, 368, 1012, 774, 517, 446, 487, 417, 542, 456,
+    783, 466, 446, 490, 759, 585, 317, 226, 532, 513, 476, 606,
+    949, 383, 672, 306, 388, 573, 1090, 840, 1075, 514, 590, 522,
+    660, 447, 568, 593, 1015, 524, 1310, 881, 1461, 944, 742, 1186,
+    14, 28, 230, 248, 88, 44, 42, 78, 20, 24, 30, 36,
+    16, 34, 118, 166, 366, 176, 56, 142, 28, 54, 70, 190,
+    46, 90, 34, 116, 18, 20, 26, 8, 3032, 1586, 1116, 594,
+    1154, 4187, 3030, 1846, 1746, 918, 94, 46, 134, 48, 20, 1262,
+    18, 28, 26, 26, 6, 8, 10, 14, 0, 10, 16, 8,
+    4, 18, 12, 6,
+];
 
-static EMBEDDED_KEY: OnceLock<Vec<u8>> = OnceLock::new();
+/// The keystream store shipped with the crate. Adding a key for a new
+/// build means appending a [[build]] entry to that file; no code changes
+/// needed.
+pub const KEYS_TOML: &str = include_str!("../keys.toml");
+
+/// One keyed game build from `keys.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildKey {
+    /// The apiimo release (semver) that first embedded this keystream.
+    pub apiimo_version: String,
+    /// Steam depot manifest of the keyed game build, when known.
+    pub manifest: Option<u64>,
+    /// The game build's depot date, when known.
+    pub date: Option<String>,
+    /// Free-form provenance note.
+    pub note: Option<String>,
+    /// The raw keystream, aligned to file offset zero.
+    pub key: Vec<u8>,
+}
+
+impl BuildKey {
+    /// Human-readable identity used in tool output.
+    pub fn tag(&self) -> String {
+        let manifest = self
+            .manifest
+            .map(|value| format!("manifest {value}"))
+            .unwrap_or_else(|| "unknown manifest".into());
+        format!("apiimo {} ({})", self.apiimo_version, manifest)
+    }
+}
+
+/// Parse the `keys.toml` keystore format. This is a strict parser for the
+/// small documented subset the file uses: a `schema = 1` line, then
+/// `[[build]]` tables with `apiimo`, optional `manifest`/`date`/`note`,
+/// and a `key` given as hex (single line or a multi-line literal string;
+/// whitespace is ignored).
+pub fn parse_keys_toml(text: &str) -> Result<Vec<BuildKey>, CryptoError> {
+    use CryptoError::KeystoreFormat;
+
+    const TRIPLE: &str = "'''";
+    let mut schema: Option<u64> = None;
+    let mut builds: Vec<BuildKey> = Vec::new();
+    let mut in_build = false;
+    let mut apiimo: Option<String> = None;
+    let mut manifest: Option<u64> = None;
+    let mut date: Option<String> = None;
+    let mut note: Option<String> = None;
+    let mut key_hex = String::new();
+
+    let flush = |builds: &mut Vec<BuildKey>,
+                 apiimo: &mut Option<String>,
+                 manifest: &mut Option<u64>,
+                 date: &mut Option<String>,
+                 note: &mut Option<String>,
+                 key_hex: &mut String|
+     -> Result<(), CryptoError> {
+        let Some(version) = apiimo.take() else {
+            return Err(KeystoreFormat(
+                "[[build]] is missing its apiimo field".into(),
+            ));
+        };
+        if builds
+            .iter()
+            .any(|existing| existing.apiimo_version == version)
+        {
+            return Err(KeystoreFormat(format!("duplicate apiimo version {version}")));
+        }
+        let key = decode_hex(&key_hex.replace(char::is_whitespace, ""))
+            .map_err(|_| KeystoreFormat(format!("key for apiimo {version} is not valid hex")))?;
+        if key.len() != KEY_PERIOD {
+            return Err(KeystoreFormat(format!(
+                "key for apiimo {version} is {} bytes, expected {KEY_PERIOD}",
+                key.len()
+            )));
+        }
+        builds.push(BuildKey {
+            apiimo_version: version,
+            manifest: manifest.take(),
+            date: date.take(),
+            note: note.take(),
+            key,
+        });
+        key_hex.clear();
+        Ok(())
+    };
+
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed == "[[build]]" {
+            if in_build {
+                flush(
+                    &mut builds,
+                    &mut apiimo,
+                    &mut manifest,
+                    &mut date,
+                    &mut note,
+                    &mut key_hex,
+                )?;
+            }
+            in_build = true;
+            continue;
+        }
+        if !in_build {
+            let Some((name, value)) = split_assignment(trimmed) else {
+                return Err(KeystoreFormat(format!("unexpected line: {trimmed:?}")));
+            };
+            if name == "schema" {
+                schema = Some(value.parse::<u64>().map_err(|_| {
+                    KeystoreFormat(format!("schema is not an integer: {value:?}"))
+                })?);
+            } else {
+                return Err(KeystoreFormat(format!("unexpected top-level field {name:?}")));
+            }
+            continue;
+        }
+        let Some((name, value)) = split_assignment(trimmed) else {
+            return Err(KeystoreFormat(format!("unexpected line: {trimmed:?}")));
+        };
+        match name {
+            "apiimo" => apiimo = Some(unquote(value)?),
+            "date" => date = Some(unquote(value)?),
+            "note" => note = Some(unquote(value)?),
+            "manifest" => {
+                manifest = Some(value.parse::<u64>().map_err(|_| {
+                    KeystoreFormat(format!("manifest is not an integer: {value:?}"))
+                })?);
+            }
+            "key" => {
+                if let Some(rest) = value.strip_prefix(TRIPLE) {
+                    key_hex.push_str(rest);
+                    for line in lines.by_ref() {
+                        match line.find(TRIPLE) {
+                            Some(closing) => {
+                                key_hex.push_str(&line[..closing]);
+                                break;
+                            }
+                            None => key_hex.push_str(line),
+                        }
+                    }
+                } else {
+                    key_hex.push_str(&unquote(value)?);
+                }
+            }
+            other => {
+                return Err(KeystoreFormat(format!("unexpected build field {other:?}")));
+            }
+        }
+    }
+    if in_build {
+        flush(
+            &mut builds,
+            &mut apiimo,
+            &mut manifest,
+            &mut date,
+            &mut note,
+            &mut key_hex,
+        )?;
+    }
+    if builds.is_empty() {
+        return Err(KeystoreFormat("no [[build]] entries found".into()));
+    }
+    if schema != Some(1) {
+        return Err(KeystoreFormat(format!(
+            "unsupported keystore schema {schema:?}, expected 1"
+        )));
+    }
+    Ok(builds)
+}
+
+fn split_assignment(line: &str) -> Option<(&str, &str)> {
+    let (name, value) = line.split_once('=')?;
+    Some((name.trim(), value.trim()))
+}
+
+fn unquote(value: &str) -> Result<String, CryptoError> {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+        return Ok(value[1..value.len() - 1].to_string());
+    }
+    Err(CryptoError::KeystoreFormat(format!(
+        "expected a quoted string, got {value:?}"
+    )))
+}
+
+static BUILD_KEYS: OnceLock<Vec<BuildKey>> = OnceLock::new();
+static STRING_PRIOR_LOGP: OnceLock<[f64; 256]> = OnceLock::new();
 
 /// Errors raised by the buffer-level crypto routines.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +247,8 @@ pub enum CryptoError {
     InvalidHex,
     InputTooShort { minimum: usize, actual: usize },
     InvalidPeriod,
+    /// The embedded keystore violates the documented keys.toml subset.
+    KeystoreFormat(String),
 }
 
 impl fmt::Display for CryptoError {
@@ -76,6 +261,7 @@ impl fmt::Display for CryptoError {
                 "metadata buffer is too short: expected at least {minimum} bytes, got {actual}"
             ),
             Self::InvalidPeriod => write!(f, "keystream period must not be zero"),
+            Self::KeystoreFormat(message) => write!(f, "keys.toml: {message}"),
         }
     }
 }
@@ -97,13 +283,28 @@ fn decode_hex(input: &str) -> Result<Vec<u8>, CryptoError> {
     Ok(bytes)
 }
 
-/// Return the embedded Aniimo key, phase-aligned to file offset zero.
-pub fn embedded_key() -> &'static [u8] {
-    EMBEDDED_KEY.get_or_init(|| {
-        let key = decode_hex(EMBEDDED_KEY_HEX).expect("embedded key is valid hex");
-        assert_eq!(key.len(), KEY_PERIOD, "embedded key has the wrong period");
-        key
+/// Return every keyed build from the embedded keystore, oldest first.
+///
+/// The keystore is parsed once; a malformed file fails the process here
+/// rather than producing silently broken decryption.
+pub fn build_keys() -> &'static [BuildKey] {
+    BUILD_KEYS.get_or_init(|| {
+        parse_keys_toml(KEYS_TOML).expect("embedded keys.toml is valid")
     })
+}
+
+/// Return every keystream recovered for a known Aniimo build, oldest first.
+pub fn embedded_keys() -> Vec<Vec<u8>> {
+    build_keys().iter().map(|build| build.key.clone()).collect()
+}
+
+/// Return the build tag for a key returned by [`select_embedded_key`] or
+/// [`embedded_keys`].
+pub fn embedded_key_tag(key: &[u8]) -> Option<String> {
+    build_keys()
+        .iter()
+        .find(|build| build.key.as_slice() == key)
+        .map(|build| build.tag())
 }
 
 /// XOR a buffer against a repeating key, starting at `phase` in that key.
@@ -139,9 +340,14 @@ pub fn decrypt_metadata(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>, Crypto
     Ok(plaintext)
 }
 
-/// Decrypt with the recovered embedded key.
+/// Decrypt with the oldest keyed build's keystream (the launch build).
 pub fn decrypt_with_embedded_key(ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    decrypt_metadata(ciphertext, embedded_key())
+    let key = build_keys()
+        .first()
+        .expect("the embedded keystore is never empty")
+        .key
+        .clone();
+    decrypt_metadata(ciphertext, &key)
 }
 
 fn printable(byte: u8) -> bool {
@@ -379,13 +585,254 @@ pub fn recover_key_with_period(ciphertext: &[u8], period: usize) -> Result<Vec<u
     Ok(key)
 }
 
+/// Start of the ciphertext window used to test candidate keys.
+const SELECT_WINDOW_START: usize = 0x6_0000;
+/// End of the ciphertext window used to test candidate keys.
+const SELECT_WINDOW_END: usize = 0x7_0000;
+/// Minimum printable rate over the selection window for a key match.
+const SELECT_MIN_RATE: f64 = 0.75;
+
+/// Log-probability of each byte under the string-section distribution of
+/// known Aniimo builds (stringLiteralData plus string heaps, all builds).
+pub fn string_prior_logp() -> &'static [f64; 256] {
+    STRING_PRIOR_LOGP.get_or_init(|| {
+        let total: u64 = STRING_PRIOR_COUNTS
+            .iter()
+            .map(|count| u64::from(*count))
+            .sum();
+        let mut logp = [0.0_f64; 256];
+        for (byte, count) in STRING_PRIOR_COUNTS.iter().enumerate() {
+            logp[byte] = ((f64::from(*count) + 1.0) / (total as f64 + 256.0)).ln();
+        }
+        logp
+    })
+}
+
+fn window_printable_rate(ciphertext: &[u8], key: &[u8]) -> f64 {
+    let start = SELECT_WINDOW_START.min(ciphertext.len());
+    let end = SELECT_WINDOW_END.min(ciphertext.len());
+    let (window, phase) = if end > start {
+        (&ciphertext[start..end], start)
+    } else {
+        (ciphertext, 0)
+    };
+    if window.is_empty() {
+        return 0.0;
+    }
+    let hits = window
+        .iter()
+        .enumerate()
+        .filter(|(index, byte)| printable(*byte ^ key[(phase + index) % key.len()]))
+        .count();
+    hits as f64 / window.len() as f64
+}
+
+/// Pick the known-build keystream that decrypts the string window of
+/// `ciphertext`, or `None` when no embedded key matches (a fresh update).
+pub fn select_embedded_key(ciphertext: &[u8]) -> Option<&'static [u8]> {
+    let keys = build_keys();
+    let mut best = None;
+    let mut best_rate = f64::NEG_INFINITY;
+    for build in keys {
+        let rate = window_printable_rate(ciphertext, &build.key);
+        if rate > best_rate {
+            best_rate = rate;
+            best = Some(build);
+        }
+    }
+    if best_rate < SELECT_MIN_RATE {
+        None
+    } else {
+        best.map(|build| build.key.as_slice())
+    }
+}
+
+/// Refine an approximate repeating-XOR key against the embedded string byte
+/// distribution.
+///
+/// The statistical [`recover_key`] pass often lands within a few hundred
+/// wrong residues while still leaving garbled bytes throughout the string
+/// tables. This refinement marks 4 KiB blocks whose current decryption is at
+/// least 60% printable, then for every key residue re-picks the byte that
+/// makes the corresponding ciphertext column most likely under the string
+/// distribution of known builds, iterating until the key is stable.
+pub fn refine_key(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    if key.is_empty() {
+        return Err(CryptoError::EmptyKey);
+    }
+    let logp = string_prior_logp();
+    let mut current = key.to_vec();
+    for _ in 0..6 {
+        let decrypted = xor_repeating(ciphertext, &current, 0)?;
+        let mut histograms = vec![[0_u64; 256]; current.len()];
+        let mut samples = vec![0_usize; current.len()];
+        let mut block_start = 0;
+        while block_start < ciphertext.len() {
+            let block_end = (block_start + 0x1000).min(ciphertext.len());
+            let printable_count = decrypted[block_start..block_end]
+                .iter()
+                .filter(|&&byte| printable(byte))
+                .count();
+            if printable_count * 10 > (block_end - block_start) * 6 {
+                for offset in block_start..block_end {
+                    let residue = offset % current.len();
+                    histograms[residue][ciphertext[offset] as usize] += 1;
+                    samples[residue] += 1;
+                }
+            }
+            block_start = block_end;
+        }
+
+        let mut changed = 0;
+        for residue in 0..current.len() {
+            if samples[residue] < 500 {
+                continue;
+            }
+            let mut best = current[residue] as usize;
+            let mut best_score = f64::NEG_INFINITY;
+            for candidate in 0..256 {
+                let mut score = 0.0;
+                for byte in 0..256 {
+                    let count = histograms[residue][byte];
+                    if count != 0 {
+                        score += count as f64 * logp[byte ^ candidate];
+                    }
+                }
+                if score > best_score {
+                    best_score = score;
+                    best = candidate;
+                }
+            }
+            if best != current[residue] as usize {
+                current[residue] = best as u8;
+                changed += 1;
+            }
+        }
+        if changed == 0 {
+            break;
+        }
+    }
+    Ok(current)
+}
+
+/// Recover a repeating-XOR key for an unknown build: statistical seed pass
+/// followed by prior-guided refinement.
+pub fn recover_key_refined(ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let seed = recover_key(ciphertext)?;
+    refine_key(ciphertext, &seed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn embedded_key_has_expected_period() {
-        assert_eq!(embedded_key().len(), KEY_PERIOD);
+    fn embedded_keystore_decodes_to_expected_period() {
+        assert!(build_keys().iter().all(|b| b.key.len() == KEY_PERIOD));
+    }
+
+    #[test]
+    fn embedded_keystore_is_complete_and_unique() {
+        let builds = build_keys();
+        assert!(builds.len() >= 2, "both known builds must stay keyed");
+        for build in builds {
+            assert_eq!(build.key.len(), KEY_PERIOD);
+            assert!(!build.apiimo_version.is_empty());
+        }
+        for pair in builds.windows(2) {
+            assert_ne!(
+                pair[0].apiimo_version, pair[1].apiimo_version,
+                "keystore versions must be unique"
+            );
+        }
+        assert_eq!(
+            embedded_key_tag(&builds[0].key),
+            Some(builds[0].tag())
+        );
+        assert_eq!(embedded_key_tag(&[0_u8; 8]), None);
+    }
+
+    #[test]
+    fn parse_keys_toml_rejects_bad_input() {
+        use CryptoError::KeystoreFormat;
+
+        assert!(matches!(
+            parse_keys_toml("schema = 1\n"),
+            Err(KeystoreFormat(_))
+        ));
+        let duplicated = KEYS_TOML.replace(
+            "apiimo = \"0.2.0\"",
+            "apiimo = \"0.1.0\"",
+        );
+        assert!(matches!(
+            parse_keys_toml(&duplicated),
+            Err(KeystoreFormat(_))
+        ));
+        let truncated = KEYS_TOML.replace(
+            "schema = 1",
+            "schema = 2",
+        );
+        assert!(matches!(
+            parse_keys_toml(&truncated),
+            Err(KeystoreFormat(_))
+        ));
+    }
+
+    fn lcg_byte(state: &mut u64) -> u8 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (*state >> 33) as u8
+    }
+
+    fn synthetic_printable(len: usize) -> Vec<u8> {
+        let alphabet = b"abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.<>()/";
+        let mut state = 0x853c_49e6_748f_ea9b_u64;
+        (0..len)
+            .map(|_| alphabet[lcg_byte(&mut state) as usize % alphabet.len()])
+            .collect()
+    }
+
+    #[test]
+    fn select_embedded_key_matches_known_builds() {
+        let plaintext = synthetic_printable(0x2_0000);
+        for key in embedded_keys() {
+            let ciphertext = xor_repeating(&plaintext, &key, 0).unwrap();
+            let selected = select_embedded_key(&ciphertext).expect("key should match");
+            assert_eq!(selected, key.as_slice());
+        }
+        let mut state = 0x243f_6a88_85a3_08d3_u64;
+        let noise: Vec<u8> = (0..0x2_0000)
+            .map(|_| lcg_byte(&mut state) ^ 0xa5)
+            .collect();
+        assert!(select_embedded_key(&noise).is_none());
+    }
+
+    #[test]
+    fn refine_key_repairs_corrupted_residues() {
+        let period = 64;
+        let plaintext = synthetic_printable(0x4_0000);
+        let mut state = 0x1319_8a2e_0370_7344_u64;
+        let true_key: Vec<u8> = (0..period).map(|_| lcg_byte(&mut state)).collect();
+        let ciphertext = xor_repeating(&plaintext, &true_key, 0).unwrap();
+
+        let mut corrupted = true_key.clone();
+        for residue in (0..period).step_by(4) {
+            corrupted[residue] ^= 0x5a;
+        }
+        let refined = refine_key(&ciphertext, &corrupted).unwrap();
+        let repaired = (0..period)
+            .filter(|residue| refined[*residue] == true_key[*residue])
+            .count();
+        assert!(repaired >= period - 1, "repaired {repaired} of {period}");
+
+        let decrypted = xor_repeating(&ciphertext, &refined, 0).unwrap();
+        let rate = decrypted
+            .iter()
+            .filter(|&&byte| printable(byte))
+            .count() as f64
+            / decrypted.len() as f64;
+        assert!(rate >= 0.97, "printable rate {rate}");
     }
 
     #[test]
@@ -394,7 +841,7 @@ mod tests {
         for (index, byte) in ciphertext.iter_mut().enumerate() {
             *byte = (index as u8).wrapping_mul(17);
         }
-        let key = embedded_key();
+        let key = &build_keys()[0].key;
         let plaintext_body = ciphertext[HEADER_SIZE..].to_vec();
         let encrypted_body = xor_repeating(&ciphertext[HEADER_SIZE..], key, HEADER_SIZE).unwrap();
         ciphertext[HEADER_SIZE..].copy_from_slice(&encrypted_body);
