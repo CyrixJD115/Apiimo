@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod discover;
 mod dump;
 mod error;
 mod metadata;
@@ -13,6 +14,7 @@ mod paths;
 mod pe;
 mod queries;
 
+pub use discover::discover_layout;
 pub use dump::{run_dump, DumpOptions, DumpReport, GeneratedFile};
 pub use error::Error;
 pub use metadata::{
@@ -29,20 +31,21 @@ pub use queries::{
     AddressMatch, ClassMatch, MethodMatch, StringLiteralMatch,
 };
 
-/// Number of types represented by the supplied Aniimo binary's metadata
-/// registration table.
+/// Number of types represented by the launch build's metadata registration
+/// table. Reference data only: the pipeline derives counts from the file.
 pub const TYPES_IN_BINARY: u32 = 18_606;
-/// Number of metadata type definitions in the verified build.
+/// Metadata type definitions in the launch build. Reference data only:
+/// the pipeline derives counts from the file.
 pub const TYPE_COUNT: usize = 28_348;
-/// Number of metadata field definitions in the verified build.
+/// Metadata field definitions in the launch build. Reference data only.
 pub const FIELD_COUNT: usize = 166_873;
-/// Number of metadata parameter definitions in the verified build.
+/// Metadata parameter definitions in the launch build. Reference data only.
 pub const PARAM_COUNT: usize = 213_031;
-/// Number of metadata method definitions in the verified build.
+/// Metadata method definitions in the launch build. Reference data only.
 pub const METHOD_COUNT: usize = 211_214;
-/// Number of metadata images in the verified build.
+/// Metadata images in the launch build. Reference data only.
 pub const IMAGE_COUNT: usize = 133;
-/// Number of metadata assemblies in the verified build.
+/// Metadata assemblies in the launch build. Reference data only.
 pub const ASSEMBLY_COUNT: usize = 132;
 /// Preferred image base for the supplied Windows build.
 pub const IMAGE_BASE: u64 = 0x1_8000_0000;

@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use crate::error::{io_error, Error};
 use crate::metadata::rebuild_metadata;
 use crate::paths::{binary_path, metadata_path, output_path, DEC_NAME};
-use crate::TYPES_IN_BINARY;
 
 /// Options for the full decrypt/rebuild/Il2CppDumper pipeline.
 #[derive(Debug, Clone)]
@@ -16,7 +15,6 @@ pub struct DumpOptions {
     pub game_dir: PathBuf,
     pub output_dir: Option<PathBuf>,
     pub dumper_command: OsString,
-    pub types_count: u32,
 }
 
 impl DumpOptions {
@@ -25,7 +23,6 @@ impl DumpOptions {
             game_dir: game_dir.into(),
             output_dir: None,
             dumper_command: OsString::from("il2cpp-dumper"),
-            types_count: TYPES_IN_BINARY,
         }
     }
 }
@@ -57,7 +54,7 @@ pub fn run_dump(options: &DumpOptions) -> Result<DumpReport, Error> {
     let metadata_file = metadata_path(&options.game_dir);
     let binary_file = binary_path(&options.game_dir);
     let raw = fs::read(&metadata_file).map_err(|source| io_error(&metadata_file, source))?;
-    let rebuilt = rebuild_metadata(&raw, options.types_count)?;
+    let rebuilt = rebuild_metadata(&raw)?;
     let output_dir = output_path(&options.game_dir, options.output_dir.as_deref())?;
     let decrypted_metadata = output_dir.join(DEC_NAME);
     fs::write(&decrypted_metadata, &rebuilt.metadata)

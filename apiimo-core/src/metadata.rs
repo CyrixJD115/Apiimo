@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 
-use apiimo_crypto::{decrypt_body, embedded_key, recover_key, HEADER_SIZE, SANITY, VERSION};
+use apiimo_crypto::{
+    decrypt_body, recover_key_refined, select_embedded_key, HEADER_SIZE, SANITY, VERSION,
+};
 
+use crate::discover::discover_layout;
 use crate::error::Error;
 
 /// A metadata section's absolute file offset and byte size.
@@ -173,6 +175,8 @@ pub struct RebuildResult {
     pub layout: MetadataLayout,
     pub fixed_defaults: usize,
     pub was_encrypted: bool,
+    /// Junk generic containers whose parameter ranges were zeroed.
+    pub nulled_containers: usize,
 }
 
 /// Build a valid 256-byte v31 header from a section layout.
@@ -195,89 +199,86 @@ pub fn build_header(layout: &MetadataLayout) -> Result<Vec<u8>, Error> {
     Ok(header)
 }
 
-/// Sanitize invalid default-value records so a vanilla dumper can read the
-/// rebuilt metadata without losing the image data.
-pub fn sanitize_defaults(
-    metadata: &mut [u8],
-    layout: &MetadataLayout,
-    types_count: u32,
-) -> Result<usize, Error> {
-    let field_defaults = layout
-        .get("fieldDefaultValues")
-        .ok_or_else(|| Error::InvalidMetadata("fieldDefaultValues section is missing".into()))?;
-    let parameter_defaults = layout.get("parameterDefaultValues").ok_or_else(|| {
-        Error::InvalidMetadata("parameterDefaultValues section is missing".into())
-    })?;
+/// Redirect every default-value record to member 0 with member 0's own
+/// declared type.
+///
+/// Protected builds plant junk throughout both default-value sections (the
+/// 2026-09-22 update carried 224,299 junk records). The forked dumper
+/// deduplicates records by member index and only writes constants whose
+/// kind matches the member's declared type, so pointing every record at
+/// member 0 with member 0's type and a zeroed blob yields a well-formed
+/// file without losing anything the game actually ships. The type index
+/// must come from the member tables themselves: a hardcoded "safe" type
+/// can be a string type on one build and a value type on another, which
+/// crashes constant generation.
+pub fn sanitize_defaults(metadata: &mut [u8], layout: &MetadataLayout) -> Result<usize, Error> {
+    let fields = layout
+        .get("fields")
+        .ok_or_else(|| Error::InvalidMetadata("fields section is missing".into()))?;
+    let parameters = layout
+        .get("parameters")
+        .ok_or_else(|| Error::InvalidMetadata("parameters section is missing".into()))?;
     let blob = layout
         .get("fieldAndParameterDefaultValueData")
-        .ok_or_else(|| {
-            Error::InvalidMetadata("fieldAndParameterDefaultValueData section is missing".into())
-        })?;
+        .ok_or_else(|| Error::InvalidMetadata("fieldAndParameterDefaultValueData section is missing".into()))?;
 
-    validate_range(metadata, field_defaults, "fieldDefaultValues")?;
-    validate_range(metadata, parameter_defaults, "parameterDefaultValues")?;
+    validate_range(metadata, fields, "fields")?;
+    validate_range(metadata, parameters, "parameters")?;
     validate_range(metadata, blob, "fieldAndParameterDefaultValueData")?;
 
-    let field_count = field_defaults.size / 12;
-    let mut counts = HashMap::<u32, usize>::new();
-    let mut safe_type = None;
-    for row in 0..field_count {
-        let offset = field_defaults.offset + row * 12;
-        let type_index = read_u32(metadata, offset + 4)
-            .ok_or_else(|| Error::InvalidMetadata("truncated field default-value record".into()))?;
-        let data_index = read_u32(metadata, offset + 8)
-            .ok_or_else(|| Error::InvalidMetadata("truncated field default-value record".into()))?;
-        if type_index < types_count && u64::from(data_index) < blob.size as u64 {
-            let count = counts.entry(type_index).or_default();
-            *count += 1;
-            if safe_type
-                .map(|(_, best_count)| *count > best_count)
-                .unwrap_or(true)
-            {
-                safe_type = Some((type_index, *count));
-            }
-        }
-    }
-    let safe_type = safe_type
-        .map(|(type_index, _)| type_index)
-        .unwrap_or(18_204);
+    let field_type = read_u32(metadata, fields.offset + 4)
+        .ok_or_else(|| Error::InvalidMetadata("fields[0] type index is truncated".into()))?;
+    let parameter_type = read_u32(metadata, parameters.offset + 8)
+        .ok_or_else(|| Error::InvalidMetadata("parameters[0] type index is truncated".into()))?;
 
-    let blob_data = &metadata[blob.offset..blob.end()];
-    let mut null_offset = 0;
-    let mut run = 0;
-    for (index, byte) in blob_data.iter().enumerate() {
-        if *byte == 0 {
-            run += 1;
-            if run >= 16 {
-                null_offset = index + 1 - run;
-                break;
-            }
-        } else {
-            run = 0;
-        }
-    }
+    // The null default lives at offset 0 of a zeroed blob.
+    metadata[blob.offset..blob.offset + blob.size].fill(0);
 
-    let mut fixed = 0;
-    for section in [field_defaults, parameter_defaults] {
-        for row in 0..(section.size / 12) {
-            let offset = section.offset + row * 12;
-            let type_index = read_u32(metadata, offset + 4)
-                .ok_or_else(|| Error::InvalidMetadata("truncated default-value record".into()))?;
-            let data_index = read_u32(metadata, offset + 8)
-                .ok_or_else(|| Error::InvalidMetadata("truncated default-value record".into()))?;
-            if type_index >= types_count || u64::from(data_index) >= blob.size as u64 {
-                write_u32(metadata, offset + 4, safe_type)?;
-                write_u32(metadata, offset + 8, null_offset as u32)?;
-                fixed += 1;
-            }
+    let mut redirected = 0;
+    for (name, type_index) in [
+        ("fieldDefaultValues", field_type),
+        ("parameterDefaultValues", parameter_type),
+    ] {
+        let section = layout
+            .get(name)
+            .ok_or_else(|| Error::InvalidMetadata(format!("{name} section is missing")))?;
+        validate_range(metadata, section, name)?;
+        for record in 0..section.size / 12 {
+            let offset = section.offset + record * 12;
+            write_u32(metadata, offset, 0)?;
+            write_u32(metadata, offset + 4, type_index)?;
+            write_u32(metadata, offset + 8, 0)?;
+            redirected += 1;
         }
     }
-    Ok(fixed)
+    Ok(redirected)
 }
 
-/// Decrypt (when necessary), rebuild the vanilla header, and sanitize default
-/// values using the verified layout.
-pub fn rebuild_metadata(raw: &[u8], types_count: u32) -> Result<RebuildResult, Error> {
+/// Decrypt a raw metadata file when needed, returning the buffer with the
+/// scrambled 256-byte header slot zeroed out.
+fn decrypt_any(raw: &[u8]) -> Result<(Vec<u8>, bool), Error> {
+    let version = read_u32(raw, 4).unwrap();
+    if version == VERSION {
+        return Ok((raw.to_vec(), false));
+    }
+    let key = match select_embedded_key(raw) {
+        Some(key) => key.to_vec(),
+        None => recover_key_refined(raw)?,
+    };
+    let body = decrypt_body(raw, &key)?;
+    let mut decrypted = vec![0; HEADER_SIZE];
+    decrypted.extend_from_slice(&body);
+    Ok((decrypted, true))
+}
+
+/// Decrypt (when necessary), discover the section layout, rebuild the
+/// vanilla header, and sanitize default values.
+///
+/// The keystream comes from the embedded per-build keys when one matches
+/// and from statistical recovery plus prior-guided refinement otherwise;
+/// the layout is always discovered structurally from the decrypted buffer,
+/// so a fresh update needs no new hardcoded constants.
+pub fn rebuild_metadata(raw: &[u8]) -> Result<RebuildResult, Error> {
     if raw.len() < HEADER_SIZE {
         return Err(Error::InvalidMetadata(format!(
             "metadata is shorter than the {HEADER_SIZE}-byte header"
@@ -289,121 +290,75 @@ pub fn rebuild_metadata(raw: &[u8], types_count: u32) -> Result<RebuildResult, E
             "expected sanity {SANITY:#x}, got {sanity:#x}"
         )));
     }
-    let version = read_u32(raw, 4).unwrap();
-    let layout = MetadataLayout::known();
 
-    let (decrypted, was_encrypted) = if version == VERSION {
-        (raw.to_vec(), false)
-    } else {
-        let key = if embedded_key_matches(raw) {
-            embedded_key().to_vec()
-        } else {
-            recover_key(raw)?
-        };
-        let body = decrypt_body(raw, &key)?;
-        let mut decrypted = vec![0; HEADER_SIZE];
-        decrypted.extend_from_slice(&body);
-        (decrypted, true)
-    };
-
-    verify_layout(&decrypted, &layout)?;
+    let (decrypted, was_encrypted) = decrypt_any(raw)?;
+    let layout = discover_layout(&decrypted)?;
     let header = build_header(&layout)?;
     let mut metadata = header;
     metadata.extend_from_slice(&decrypted[HEADER_SIZE..]);
-    let fixed_defaults = sanitize_defaults(&mut metadata, &layout, types_count)?;
+    let fixed_defaults = sanitize_defaults(&mut metadata, &layout)?;
+    let nulled_containers = sanitize_generic_containers(&mut metadata, &layout)?;
 
     Ok(RebuildResult {
         metadata,
         layout,
         fixed_defaults,
         was_encrypted,
+        nulled_containers,
     })
 }
 
-/// Rediscover the first two string-table sections using the lightweight
-/// experimental scan from the Python tool.
-pub fn discover_sections(raw: &[u8]) -> Result<MetadataLayout, Error> {
-    let decrypted = decrypt_with_embedded_key(raw)?;
-    let mut sections = BTreeMap::new();
-    let mut word_offset = HEADER_SIZE / 4;
-    let mut count = 0usize;
-    let mut data_index = 0usize;
-    while word_offset + 1 < decrypted.len() / 4 {
-        let count_word = read_u32(&decrypted, word_offset * 4).unwrap() as usize;
-        let index_word = read_u32(&decrypted, word_offset * 4 + 4).unwrap() as usize;
-        if count_word > 65_536 || index_word != data_index {
-            break;
+/// Null out junk generic containers that reference parameters past the end
+/// of the generic parameter table.
+///
+/// The 2026-09-22 update plants containers whose parameter range starts at
+/// or beyond the table end; the dummy-assembly generator walks them
+/// straight into an out-of-range index. Zeroing the range keeps the owner
+/// reference intact while making the container describe zero parameters.
+pub fn sanitize_generic_containers(
+    metadata: &mut [u8],
+    layout: &MetadataLayout,
+) -> Result<usize, Error> {
+    let Some(containers) = layout.get("genericContainers") else {
+        return Ok(0);
+    };
+    let Some(parameters) = layout.get("genericParameters") else {
+        return Ok(0);
+    };
+    validate_range(metadata, containers, "genericContainers")?;
+    validate_range(metadata, parameters, "genericParameters")?;
+    let parameter_count = parameters.size / 16;
+
+    let mut nulled = 0;
+    for record in 0..containers.size / 16 {
+        let offset = containers.offset + record * 16;
+        let owner = read_u32(metadata, offset)
+            .ok_or_else(|| Error::InvalidMetadata("truncated generic container".into()))?;
+        let argc = read_u32(metadata, offset + 8)
+            .ok_or_else(|| Error::InvalidMetadata("truncated generic container".into()))?;
+        let start = read_u32(metadata, offset + 12)
+            .ok_or_else(|| Error::InvalidMetadata("truncated generic container".into()))?;
+        if start as usize + argc as usize > parameter_count
+            || argc > 16
+            || owner as usize > 300_000
+        {
+            write_u32(metadata, offset + 8, 0)?;
+            write_u32(metadata, offset + 12, 0)?;
+            nulled += 1;
         }
-        count += 1;
-        data_index = data_index.saturating_add(count_word);
-        word_offset += 2;
     }
-    sections.insert(
-        "stringLiteral",
-        MetadataSection::new(HEADER_SIZE, count * 8),
-    );
-    sections.insert(
-        "stringLiteralData",
-        MetadataSection::new(HEADER_SIZE + count * 8, data_index),
-    );
-    Ok(MetadataLayout { sections })
+    Ok(nulled)
 }
 
-fn embedded_key_matches(raw: &[u8]) -> bool {
-    let start = 0x70_000;
-    let end = (start + 0x40).min(raw.len());
-    if start >= end {
-        return true;
+/// Discover the full section layout of a possibly-encrypted metadata file.
+pub fn discover_sections(raw: &[u8]) -> Result<MetadataLayout, Error> {
+    if raw.len() < HEADER_SIZE {
+        return Err(Error::InvalidMetadata(format!(
+            "metadata is shorter than the {HEADER_SIZE}-byte header"
+        )));
     }
-    let key = embedded_key();
-    let printable_count = (start..end)
-        .filter(|&index| {
-            let byte = raw[index] ^ key[index % key.len()];
-            (32..127).contains(&byte)
-        })
-        .count();
-    printable_count * 10 >= (end - start) * 8
-}
-
-fn verify_layout(metadata: &[u8], layout: &MetadataLayout) -> Result<(), Error> {
-    let type_definitions = layout
-        .get("typeDefinitions")
-        .ok_or_else(|| Error::InvalidMetadata("typeDefinitions section is missing".into()))?;
-    let events = layout
-        .get("events")
-        .ok_or_else(|| Error::InvalidMetadata("events section is missing".into()))?;
-    // v31 TypeDefinition: `token` at byte 84, sizeof 88. The Python tool checks
-    // word 21 (`to`) and word 43 (`to + 22`) - the tokens of two consecutive
-    // type definitions, 22 words apart.
-    const TYPE_DEFINITION_SIZE: usize = 88;
-    const TYPE_TOKEN_OFFSET: usize = 84;
-    const EVENT_TOKEN_OFFSET: usize = 20;
-    let type_token_a = type_definitions
-        .offset
-        .checked_add(TYPE_TOKEN_OFFSET)
-        .ok_or_else(|| Error::InvalidMetadata("type definition offset overflow".into()))?;
-    let type_token_b = type_definitions
-        .offset
-        .checked_add(TYPE_TOKEN_OFFSET + TYPE_DEFINITION_SIZE)
-        .ok_or_else(|| Error::InvalidMetadata("type definition offset overflow".into()))?;
-    let event_token = events
-        .offset
-        .checked_add(EVENT_TOKEN_OFFSET)
-        .ok_or_else(|| Error::InvalidMetadata("event offset overflow".into()))?;
-    let type_a = read_u32(metadata, type_token_a)
-        .ok_or_else(|| Error::InvalidMetadata("type-definition token is truncated".into()))?;
-    let type_b = read_u32(metadata, type_token_b)
-        .ok_or_else(|| Error::InvalidMetadata("type-definition token is truncated".into()))?;
-    let event = read_u32(metadata, event_token)
-        .ok_or_else(|| Error::InvalidMetadata("event token is truncated".into()))?;
-    let tokens_ok = type_a >> 24 == 0x02 && type_b >> 24 == 0x02;
-    let event_ok = event >> 24 == 0x14;
-    if !tokens_ok || !event_ok {
-        return Err(Error::InvalidMetadata(
-            "verified section layout does not match the metadata build".into(),
-        ));
-    }
-    Ok(())
+    let (decrypted, _) = decrypt_any(raw)?;
+    discover_layout(&decrypted)
 }
 
 fn validate_range(metadata: &[u8], section: MetadataSection, name: &str) -> Result<(), Error> {
@@ -444,64 +399,82 @@ fn push_u32(data: &mut Vec<u8>, value: u32) {
     data.extend_from_slice(&value.to_le_bytes());
 }
 
-fn decrypt_with_embedded_key(raw: &[u8]) -> Result<Vec<u8>, Error> {
-    Ok(apiimo_crypto::decrypt_metadata(raw, embedded_key())?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn verify_layout_checks_consecutive_type_tokens() {
-        // Small synthetic layout: two 88-byte type definitions followed by an
-        // event, mirroring where the token fields live in v31 metadata.
+    fn sanitize_defaults_redirects_every_record_to_member_zero() {
+        // fields[0] declares type 7; parameters[0] declares type 9.
+        let mut fields = vec![0_u8; 4 * 12];
+        write_u32(&mut fields, 0, 0x11).unwrap();
+        write_u32(&mut fields, 4, 7).unwrap();
+        write_u32(&mut fields, 8, 0x0400_0001).unwrap();
+        let mut parameters = vec![0_u8; 2 * 12];
+        write_u32(&mut parameters, 0, 0x22).unwrap();
+        write_u32(&mut parameters, 4, 0x0800_0001).unwrap();
+        write_u32(&mut parameters, 8, 9).unwrap();
+        let defaults = vec![0xFF_u8; 4 * 12];
+        let mut metadata = Vec::new();
+        metadata.extend_from_slice(&fields);
+        metadata.extend_from_slice(&parameters);
+        metadata.extend_from_slice(&defaults);
+        metadata.extend_from_slice(&[0xAA_u8; 20]);
+
         let layout = MetadataLayout::from_entries([
-            ("typeDefinitions", MetadataSection::new(0x100, 2 * 88)),
-            ("events", MetadataSection::new(0x1B0, 24)),
+            ("fields", MetadataSection::new(0, fields.len())),
+            ("parameters", MetadataSection::new(fields.len(), parameters.len())),
+            ("fieldDefaultValues", MetadataSection::new(fields.len() + parameters.len(), 24)),
+            (
+                "parameterDefaultValues",
+                MetadataSection::new(fields.len() + parameters.len() + 24, 24),
+            ),
+            (
+                "fieldAndParameterDefaultValueData",
+                MetadataSection::new(metadata.len() - 20, 20),
+            ),
         ]);
-        let mut metadata = vec![0_u8; 0x1C8];
-        // token of TypeDefinition[0] (byte 84) and [1] (byte 84 + 88): 0x02tttttt.
-        write_u32(&mut metadata, 0x100 + 84, 0x0200_0001).unwrap();
-        write_u32(&mut metadata, 0x100 + 84 + 88, 0x0200_0002).unwrap();
-        // token of EventInfo (byte 20): 0x14eeeeee.
-        write_u32(&mut metadata, 0x1B0 + 20, 0x1400_0003).unwrap();
-        assert!(verify_layout(&metadata, &layout).is_ok());
 
-        // A count field masquerading as the second token (the old bug: byte
-        // +88 instead of +172) must not pass verification.
-        write_u32(&mut metadata, 0x100 + 84 + 88, 0x0000_0010).unwrap();
-        assert!(verify_layout(&metadata, &layout).is_err());
-
-        // A non-table token on the first definition must fail as well.
-        write_u32(&mut metadata, 0x100 + 84 + 88, 0x0200_0002).unwrap();
-        write_u32(&mut metadata, 0x100 + 84, 0x0600_0009).unwrap();
-        assert!(verify_layout(&metadata, &layout).is_err());
+        let redirected = sanitize_defaults(&mut metadata, &layout).unwrap();
+        assert_eq!(redirected, 4);
+        assert!(
+            metadata[metadata.len() - 20..]
+                .iter()
+                .all(|byte| *byte == 0),
+            "blob must be zeroed"
+        );
+        for record in 0..2 {
+            let offset = fields.len() + parameters.len() + record * 12;
+            assert_eq!(read_u32(&metadata, offset), Some(0));
+            assert_eq!(read_u32(&metadata, offset + 4), Some(7));
+            assert_eq!(read_u32(&metadata, offset + 8), Some(0));
+        }
+        for record in 0..2 {
+            let offset = fields.len() + parameters.len() + 24 + record * 12;
+            assert_eq!(read_u32(&metadata, offset), Some(0));
+            assert_eq!(read_u32(&metadata, offset + 4), Some(9));
+            assert_eq!(read_u32(&metadata, offset + 8), Some(0));
+        }
     }
 
     #[test]
-    fn sanitize_defaults_replaces_invalid_records() {
-        let layout = MetadataLayout::from_entries([
-            ("fieldDefaultValues", MetadataSection::new(0, 24)),
-            ("parameterDefaultValues", MetadataSection::new(24, 12)),
-            (
-                "fieldAndParameterDefaultValueData",
-                MetadataSection::new(36, 32),
-            ),
-        ]);
-        let mut metadata = vec![0_u8; 68];
-        write_u32(&mut metadata, 4, 99).unwrap();
-        write_u32(&mut metadata, 8, 0).unwrap();
-        write_u32(&mut metadata, 16, 2).unwrap();
-        write_u32(&mut metadata, 20, 1).unwrap();
-        write_u32(&mut metadata, 28, 3).unwrap();
-        write_u32(&mut metadata, 32, 99).unwrap();
+    fn rebuild_rejects_wrong_sanity() {
+        let raw = vec![0x41_u8; 0x200];
+        assert!(rebuild_metadata(&raw).is_err());
+    }
 
-        let fixed = sanitize_defaults(&mut metadata, &layout, 10).unwrap();
-        assert_eq!(fixed, 2);
-        assert_eq!(read_u32(&metadata, 4), Some(2));
-        assert_eq!(read_u32(&metadata, 8), Some(0));
-        assert_eq!(read_u32(&metadata, 28), Some(2));
-        assert_eq!(read_u32(&metadata, 32), Some(0));
+    /// Rebuild a real game metadata file when its path is provided through
+    /// `APIIMO_TEST_METADATA`; skipped otherwise.
+    #[test]
+    #[ignore]
+    fn rebuild_real_metadata() {
+        let Ok(path) = std::env::var("APIIMO_TEST_METADATA") else {
+            return;
+        };
+        let raw = std::fs::read(&path).expect("test metadata file is readable");
+        let rebuilt = rebuild_metadata(&raw).expect("real metadata rebuilds");
+        let type_definitions = rebuilt.layout.get("typeDefinitions").unwrap();
+        assert!(type_definitions.size > 0);
+        assert!(rebuilt.metadata.len() == raw.len());
     }
 }
