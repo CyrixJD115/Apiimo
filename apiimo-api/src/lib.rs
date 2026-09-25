@@ -61,6 +61,40 @@ fn decoded_save_path(raw_path: &Path) -> PathBuf {
     }
 }
 
+/// Undo the gate's per-frame body compression, returning the bytes and the
+/// codec that matched ("zlib", "deflate", "zstd", or "raw" when the body is
+/// already plain protobuf).
+pub(crate) fn decompress_body(body: &[u8]) -> (Vec<u8>, &'static str) {
+    if body.is_empty() {
+        return (Vec::new(), "raw");
+    }
+    if let Some(out) = try_decompress(flate2::read::ZlibDecoder::new(body)) {
+        return (out, "zlib");
+    }
+    if let Some(out) = try_decompress(flate2::read::DeflateDecoder::new(body)) {
+        return (out, "deflate");
+    }
+    if let Ok(mut decoder) = ruzstd::StreamingDecoder::new(body) {
+        let mut out = Vec::new();
+        if decoder.read_to_end(&mut out).is_ok() && !out.is_empty() {
+            return (out, "zstd");
+        }
+    }
+    (body.to_vec(), "raw")
+}
+
+/// Read a flate2 decoder to the end, accepting only full, non-empty streams.
+fn try_decompress<D: std::io::Read>(decoder: D) -> Option<Vec<u8>> {
+    let mut decoder = decoder;
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok()?;
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// One gate's liveness, as reported by `gate-status`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GateStatusRow {
@@ -140,6 +174,12 @@ pub enum Command {
         input: PathBuf,
         output: PathBuf,
     },
+    /// Become the client: full handshake + LoginService.verifySdk with the
+    /// banked FPX credentials, printing the login response.
+    GateLogin {
+        msgate: String,
+        credentials: PathBuf,
+    },
     /// Probe every known production game gate and classify each as up,
     /// forbidden (maintenance), or unreachable.
     GateStatus,
@@ -198,6 +238,7 @@ pub struct SectionEntry {
 /// Structured result of one command.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Output {
+    GateLogin(apiimo_api_shim::GateLoginData),
     Dump(Box<DumpReport>),
     Sections(Vec<SectionEntry>),
     Classes(Vec<ClassMatch>),
@@ -532,42 +573,50 @@ impl Apiimo {
                 let key = decode_hex(key_hex).map_err(|error| {
                     apiimo_network::NetworkError::Xdf(format!("bad key hex: {error:?}"))
                 })?;
-                let mut data = std::fs::read(input).map_err(|source| ApiError::Io {
+                let data = std::fs::read(input).map_err(|source| ApiError::Io {
                     path: input.clone(),
                     source,
                 })?;
                 let input_len = data.len();
-                apiimo_network::rc4(&key, &mut data);
-                std::fs::write(output, &data).map_err(|source| ApiError::Io {
+                // Captured streams begin with plaintext handshake frames
+                // (the client may resend its handshake); strip them, then
+                // decode the remainder with a fresh key schedule per frame
+                // (the gate re-keys every dispatched message).
+                let (plain, rest) = apiimo_network::split_plain_prefix(&data, 16);
+                let decoded = apiimo_network::decode_dispatch_frames(&key, rest, 64);
+                let mut out_bytes = Vec::new();
+                let mut frame_codecs = Vec::new();
+                for (index, frame) in decoded.iter().enumerate() {
+                    // The gate compresses every body before encrypting it
+                    // (zlib by default, zstd when negotiated); undo that so
+                    // the output stream holds parseable protobuf bodies.
+                    let (body, codec) = decompress_body(&frame.body);
+                    out_bytes.extend_from_slice(&((body.len() + 2) as u32).to_le_bytes());
+                    out_bytes.extend_from_slice(&frame.method.to_le_bytes());
+                    out_bytes.extend_from_slice(&body);
+                    let preview = if index < 8 {
+                        format!(" {}", hex(&body[..body.len().min(32)]))
+                    } else {
+                        String::new()
+                    };
+                    frame_codecs.push(format!(
+                        "m{} {}B {}->{}B{}",
+                        frame.method,
+                        frame.body.len(),
+                        codec,
+                        body.len(),
+                        preview
+                    ));
+                }
+                std::fs::write(output, &out_bytes).map_err(|source| ApiError::Io {
                     path: output.clone(),
                     source,
                 })?;
-                let mut frames = Vec::new();
-                let mut offset = 0usize;
-                for _ in 0..16 {
-                    if offset + 6 > data.len() {
-                        break;
-                    }
-                    let total = u32::from_le_bytes([
-                        data[offset],
-                        data[offset + 1],
-                        data[offset + 2],
-                        data[offset + 3],
-                    ]) as usize;
-                    if total < 2 || offset + 4 + total > data.len() {
-                        frames.push(format!("(stream ends after {} bytes)", offset));
-                        break;
-                    }
-                    let method = u16::from_le_bytes([data[offset + 4], data[offset + 5]]);
-                    let body_end = (offset + 4 + total).min(data.len());
-                    frames.push(format!(
-                        "m{} {}B {}",
-                        method,
-                        total - 2,
-                        hex(&data[offset + 6..body_end.min(offset + 6 + 48)])
-                    ));
-                    offset += 4 + total;
-                }
+                let frames: Vec<String> = plain
+                    .iter()
+                    .map(|f| format!("plain m{} {}B", f.method, f.body.len()))
+                    .chain(frame_codecs.into_iter())
+                    .collect();
                 Ok(Output::GateDecryptResult {
                     key_bytes: key.len(),
                     input_bytes: input_len,
@@ -575,6 +624,10 @@ impl Apiimo {
                     frames,
                 })
             }
+            Command::GateLogin {
+                msgate,
+                credentials,
+            } => gate_login(msgate.to_string(), credentials.clone()).map(Output::GateLogin),
             Command::GateStatus => {
                 use apiimo_network::{EndpointClass, GateStatus as GateState};
                 let mut entries = Vec::new();
@@ -740,6 +793,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decompress_body_detects_zlib_and_falls_through() {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"hello save body").unwrap();
+        let zlib_frame = encoder.finish().unwrap();
+        let (out, codec) = decompress_body(&zlib_frame);
+        assert_eq!(codec, "zlib");
+        assert_eq!(out, b"hello save body");
+        // Plain protobuf-looking bytes pass through untouched.
+        let raw = [0x08u8, 0x01, 0x12, 0x03, b'a', b'b', b'c'];
+        let (out, codec) = decompress_body(&raw);
+        assert_eq!(codec, "raw");
+        assert_eq!(out, raw.to_vec());
+    }
+
+    #[test]
     fn constructors_apply_python_defaults() {
         assert_eq!(
             Command::classes("Player"),
@@ -779,5 +848,122 @@ mod tests {
             decoded_save_path(Path::new("client_info_123.bin")),
             PathBuf::from("client_info_123.decoded.bin")
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// gate-login: become the client
+// ---------------------------------------------------------------------------
+
+/// Run the full ms-gate login: handshake with OUR key, connectServer,
+/// then LoginService.verifySdk with the banked FPX ticket.
+fn gate_login(
+    msgate: String,
+    credentials: PathBuf,
+) -> Result<apiimo_api_shim::GateLoginData, ApiError> {
+    use apiimo_network::LiveSession;
+    use rsa::pkcs1::DecodeRsaPublicKey;
+
+    let raw = std::fs::read_to_string(&credentials).map_err(|source| ApiError::Io {
+        path: credentials.clone(),
+        source,
+    })?;
+    let creds: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| ApiError::Io {
+            path: credentials.clone(),
+            source: std::io::Error::other(e.to_string()),
+        })?;
+    let ticket = creds["ticket"]
+        .as_str()
+        .ok_or_else(|| ApiError::Io {
+            path: credentials.clone(),
+            source: std::io::Error::other("credentials missing 'ticket'"),
+        })?
+        .to_string();
+
+    // gate public key from the game's shipped Lua config
+    let game = default_game_dir();
+    let xdf_path = game
+        .join("Aniimo_Data/StreamingAssets/cvs/res/lua/LuaScripts.xdf");
+    let mut xdf = apiimo_network::XdfContainer::open(&xdf_path).map_err(|e| {
+        ApiError::Io {
+            path: xdf_path.clone(),
+            source: std::io::Error::other(e.to_string()),
+        }
+    })?;
+    let conf = xdf
+        .read("xfs/luascripts/Network/conf.json")
+        .map_err(|e| ApiError::Io {
+            path: xdf_path,
+            source: std::io::Error::other(e.to_string()),
+        })?;
+    let conf_json: serde_json::Value =
+        serde_json::from_slice(&conf).map_err(|e| ApiError::Io {
+            path: PathBuf::from("conf.json"),
+            source: std::io::Error::other(e.to_string()),
+        })?;
+    let pem = conf_json["pubKeyData"]
+        .as_str()
+        .ok_or_else(|| ApiError::Io {
+            path: PathBuf::from("conf.json"),
+            source: std::io::Error::other("conf.json missing pubKeyData"),
+        })?;
+    let public_key =
+        rsa::RsaPublicKey::from_pkcs1_pem(pem).map_err(|e| ApiError::Io {
+            path: PathBuf::from("conf.json"),
+            source: std::io::Error::other(format!("bad PEM: {e}")),
+        })?;
+    use rsa::pkcs1::EncodeRsaPublicKey;
+    let der = public_key.to_pkcs1_der().map_err(|e| ApiError::Io {
+        path: PathBuf::from("conf.json"),
+        source: std::io::Error::other(e.to_string()),
+    })?;
+
+    let (host, port) = match msgate.rsplit_once(':') {
+        Some((h, p)) => (
+            h.to_string(),
+            p.parse::<u16>().unwrap_or(10000),
+        ),
+        None => (msgate.clone(), 10000),
+    };
+
+    eprintln!("[gate-login] establishing session...");
+    let mut session = LiveSession::establish(&host, port, der.as_bytes())
+        .map_err(|e| ApiError::Io {
+            path: PathBuf::from(format!("{host}:{port}")),
+            source: std::io::Error::other(e.to_string()),
+        })?;
+    eprintln!("[gate-login] established; the ms-gate never gets connectServer (that is world-gate only - the login gates answer it Busy by design)");
+    let key_hex: String =
+        session.key.iter().map(|b| format!("{b:02x}")).collect();
+
+    // verifySdk with the banked ticket - byte-exact message shape
+    eprintln!("[gate-login] calling verifySdk...");
+    let resp = session
+        .verify_sdk(&ticket)
+        .map_err(|e| ApiError::Io {
+            path: PathBuf::from("verifySdk"),
+            source: std::io::Error::other(e.to_string()),
+        })?;
+
+    let response_utf8 = String::from_utf8_lossy(&resp).to_string();
+    Ok(apiimo_api_shim::GateLoginData {
+        msgate: format!("{host}:{port}"),
+        token: 0,
+        session_key_hex: key_hex,
+        response_hex: resp.iter().map(|b| format!("{b:02x}")).collect(),
+        response_utf8,
+    })
+}
+
+/// Small holder so the report types stay out of the public enum noise.
+pub mod apiimo_api_shim {
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    pub struct GateLoginData {
+        pub msgate: String,
+        pub token: i64,
+        pub session_key_hex: String,
+        pub response_hex: String,
+        pub response_utf8: String,
     }
 }

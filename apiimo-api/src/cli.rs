@@ -151,6 +151,12 @@ where
             input: PathBuf::from(arg(2, "gate-decrypt <key_hex> <input> <output>")?),
             output: PathBuf::from(arg(3, "gate-decrypt <key_hex> <input> <output>")?),
         },
+        "gate-login" => Command::GateLogin {
+            msgate: arg(1, "gate-login <msgate-host:port> <credentials.json>")?.to_string(),
+            credentials: PathBuf::from(
+                arg(2, "gate-login <msgate-host:port> <credentials.json>")?,
+            ),
+        },
         "gate-status" => Command::GateStatus,
         "xdf-cat" => Command::XdfCat {
             container: PathBuf::from(arg(1, "xdf-cat <path> <entry>")?),
@@ -369,6 +375,15 @@ pub fn render(output: &Output) -> String {
             let _ = writeln!(text, "  url      : {url}");
             let _ = writeln!(text, "  saved    : {} ({} bytes)", path.display(), raw_bytes);
             let _ = writeln!(text, "  decoded  : {decoded_bytes} bytes ({format})");
+        }
+        Output::GateLogin(data) => {
+            use std::fmt::Write;
+            let _ = writeln!(text, "gate-login: connected as client to {}", data.msgate);
+            let _ = writeln!(text, "  session key: {}", data.session_key_hex);
+            let _ = writeln!(text, "  verifySdk response ({} bytes):", data.response_hex.len() / 2);
+            for chunk in data.response_utf8.as_bytes().chunks(96) {
+                let _ = writeln!(text, "    {}", String::from_utf8_lossy(chunk));
+            }
         }
         Output::GateDecryptResult {
             key_bytes,

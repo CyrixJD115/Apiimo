@@ -22,6 +22,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 ruzstd = "0.7"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha1 = "0.10"
 rmp = "0.8"

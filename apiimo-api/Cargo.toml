@@ -7,12 +7,15 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rsa.workspace = true
+sha1.workspace = true
 apiimo-core.workspace = true
 apiimo-network.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ruzstd.workspace = true
+flate2.workspace = true
 ureq.workspace = true
 
 [[bin]]
