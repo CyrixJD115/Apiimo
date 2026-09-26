@@ -157,6 +157,34 @@ where
                 arg(2, "gate-login <msgate-host:port> <credentials.json>")?,
             ),
         },
+        "world-pull" => Command::WorldPull {
+            msgate: arg(
+                1,
+                "world-pull <msgate-host:port> <worldgate-host:port> <credentials.json> <game_uid> [out]",
+            )?
+            .to_string(),
+            worldgate: arg(
+                2,
+                "world-pull <msgate-host:port> <worldgate-host:port> <credentials.json> <game_uid> [out]",
+            )?
+            .to_string(),
+            credentials: PathBuf::from(arg(
+                3,
+                "world-pull <msgate-host:port> <worldgate-host:port> <credentials.json> <game_uid> [out]",
+            )?),
+            uid: arg(
+                4,
+                "world-pull <msgate-host:port> <worldgate-host:port> <credentials.json> <game_uid> [out]",
+            )?
+            .parse()
+            .map_err(|_| CliError::UnknownCommand(
+                "world-pull: <game_uid> must be a number".into(),
+            ))?,
+            out: args
+                .get(5)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("world_stream_dump.bin")),
+        },
         "gate-status" => Command::GateStatus,
         "xdf-cat" => Command::XdfCat {
             container: PathBuf::from(arg(1, "xdf-cat <path> <entry>")?),
@@ -385,6 +413,25 @@ pub fn render(output: &Output) -> String {
                 let _ = writeln!(text, "    {}", String::from_utf8_lossy(chunk));
             }
         }
+        Output::WorldPull(data) => {
+            use std::fmt::Write;
+            let _ = writeln!(text, "world-pull: full login chain executed");
+            let _ = writeln!(text, "  ms-gate    : {}", data.msgate);
+            let _ = writeln!(text, "  world gate : {}", data.worldgate);
+            let _ = writeln!(text, "  account    : {}", data.account_id);
+            let _ = writeln!(text, "  game uid   : {}", data.uid);
+            let _ = writeln!(text, "  verifySdk  : {} bytes", data.verify_bytes);
+            let _ = writeln!(text, "  CS_Login   : {} bytes", data.cs_login_bytes);
+            let _ = writeln!(text, "  bind       : {} bytes", data.bind_bytes);
+            let _ = writeln!(text, "  connect    : {:?}", data.connect_resp);
+            let _ = writeln!(text, "  frames     : {} captured", data.frames_captured);
+            let _ = writeln!(text, "  saved      : {}", data.out);
+            let _ = writeln!(text, "  ms session key : {}", data.msgate_key_hex);
+            let _ = writeln!(text, "  world session key: {}", data.world_key_hex);
+            for line in &data.notes {
+                let _ = writeln!(text, "  note: {line}");
+            }
+        }
         Output::GateDecryptResult {
             key_bytes,
             input_bytes,
@@ -474,6 +521,8 @@ Network (login gates & saves):
   gate-handshake [host:port]     anonymous session-key exchange with a gate
   save-pull <uid> [out]          download an account's client-info save blob
   gate-decrypt <key_hex> <in> <out>  decrypt a captured gate stream with an RC4 key
+  world-pull <msgate> <worldgate> <creds> <uid> [out]
+                                 full login chain + world-gate save stream capture
 
 Options:
   --game <dir>                   game root (default: $APIIMO_GAME or auto-discovery)

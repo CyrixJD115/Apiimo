@@ -180,6 +180,16 @@ pub enum Command {
         msgate: String,
         credentials: PathBuf,
     },
+    /// The full login chain against a FRESH ticket: verifySdk -> CS_Login
+    /// -> PhonestGate.bind, then the WORLD gate: connectServer{auth} and
+    /// capture of the save stream to `out`.
+    WorldPull {
+        msgate: String,
+        worldgate: String,
+        credentials: PathBuf,
+        uid: u64,
+        out: PathBuf,
+    },
     /// Probe every known production game gate and classify each as up,
     /// forbidden (maintenance), or unreachable.
     GateStatus,
@@ -239,6 +249,7 @@ pub struct SectionEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Output {
     GateLogin(apiimo_api_shim::GateLoginData),
+    WorldPull(Box<apiimo_api_shim::WorldPullData>),
     Dump(Box<DumpReport>),
     Sections(Vec<SectionEntry>),
     Classes(Vec<ClassMatch>),
@@ -628,6 +639,20 @@ impl Apiimo {
                 msgate,
                 credentials,
             } => gate_login(msgate.to_string(), credentials.clone()).map(Output::GateLogin),
+            Command::WorldPull {
+                msgate,
+                worldgate,
+                credentials,
+                uid,
+                out,
+            } => world_pull(
+                msgate.to_string(),
+                worldgate.to_string(),
+                credentials.clone(),
+                *uid,
+                out.clone(),
+            )
+            .map(|data| Output::WorldPull(Box::new(data))),
             Command::GateStatus => {
                 use apiimo_network::{EndpointClass, GateStatus as GateState};
                 let mut entries = Vec::new();
@@ -855,41 +880,29 @@ mod tests {
 // gate-login: become the client
 // ---------------------------------------------------------------------------
 
-/// Run the full ms-gate login: handshake with OUR key, connectServer,
-/// then LoginService.verifySdk with the banked FPX ticket.
-fn gate_login(
-    msgate: String,
-    credentials: PathBuf,
-) -> Result<apiimo_api_shim::GateLoginData, ApiError> {
-    use apiimo_network::LiveSession;
-    use rsa::pkcs1::DecodeRsaPublicKey;
-
-    let raw = std::fs::read_to_string(&credentials).map_err(|source| ApiError::Io {
-        path: credentials.clone(),
+/// Read + parse a credentials json (ticket, account_id, channel_uid, ...).
+fn read_credentials(
+    path: &PathBuf,
+) -> Result<serde_json::Value, ApiError> {
+    let raw = std::fs::read_to_string(path).map_err(|source| ApiError::Io {
+        path: path.clone(),
         source,
     })?;
-    let creds: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| ApiError::Io {
-            path: credentials.clone(),
-            source: std::io::Error::other(e.to_string()),
-        })?;
-    let ticket = creds["ticket"]
-        .as_str()
-        .ok_or_else(|| ApiError::Io {
-            path: credentials.clone(),
-            source: std::io::Error::other("credentials missing 'ticket'"),
-        })?
-        .to_string();
+    serde_json::from_str(&raw).map_err(|e| ApiError::Io {
+        path: path.clone(),
+        source: std::io::Error::other(e.to_string()),
+    })
+}
 
-    // gate public key from the game's shipped Lua config
+/// The gate RSA public key ships inside the game's Lua container
+/// (conf.json pubKeyData) - load and convert to PKCS#1 DER.
+fn load_gate_pubkey_der() -> Result<Vec<u8>, ApiError> {
+    use rsa::pkcs1::{DecodeRsaPublicKey, EncodeRsaPublicKey};
     let game = default_game_dir();
-    let xdf_path = game
-        .join("Aniimo_Data/StreamingAssets/cvs/res/lua/LuaScripts.xdf");
-    let mut xdf = apiimo_network::XdfContainer::open(&xdf_path).map_err(|e| {
-        ApiError::Io {
-            path: xdf_path.clone(),
-            source: std::io::Error::other(e.to_string()),
-        }
+    let xdf_path = game.join("Aniimo_Data/StreamingAssets/cvs/res/lua/LuaScripts.xdf");
+    let mut xdf = apiimo_network::XdfContainer::open(&xdf_path).map_err(|e| ApiError::Io {
+        path: xdf_path.clone(),
+        source: std::io::Error::other(e.to_string()),
     })?;
     let conf = xdf
         .read("xfs/luascripts/Network/conf.json")
@@ -908,34 +921,54 @@ fn gate_login(
             path: PathBuf::from("conf.json"),
             source: std::io::Error::other("conf.json missing pubKeyData"),
         })?;
-    let public_key =
-        rsa::RsaPublicKey::from_pkcs1_pem(pem).map_err(|e| ApiError::Io {
-            path: PathBuf::from("conf.json"),
-            source: std::io::Error::other(format!("bad PEM: {e}")),
-        })?;
-    use rsa::pkcs1::EncodeRsaPublicKey;
+    let public_key = rsa::RsaPublicKey::from_pkcs1_pem(pem).map_err(|e| ApiError::Io {
+        path: PathBuf::from("conf.json"),
+        source: std::io::Error::other(format!("bad PEM: {e}")),
+    })?;
     let der = public_key.to_pkcs1_der().map_err(|e| ApiError::Io {
         path: PathBuf::from("conf.json"),
         source: std::io::Error::other(e.to_string()),
     })?;
+    Ok(der.as_bytes().to_vec())
+}
 
-    let (host, port) = match msgate.rsplit_once(':') {
-        Some((h, p)) => (
-            h.to_string(),
-            p.parse::<u16>().unwrap_or(10000),
-        ),
-        None => (msgate.clone(), 10000),
-    };
+fn split_host_port(target: &str, default_port: u16) -> (String, u16) {
+    match target.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(default_port)),
+        None => (target.to_string(), default_port),
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Run the full ms-gate login: handshake with OUR key, connectServer,
+/// then LoginService.verifySdk with the banked FPX ticket.
+fn gate_login(
+    msgate: String,
+    credentials: PathBuf,
+) -> Result<apiimo_api_shim::GateLoginData, ApiError> {
+    use apiimo_network::LiveSession;
+
+    let creds = read_credentials(&credentials)?;
+    let ticket = creds["ticket"]
+        .as_str()
+        .ok_or_else(|| ApiError::Io {
+            path: credentials.clone(),
+            source: std::io::Error::other("credentials missing 'ticket'"),
+        })?
+        .to_string();
+    let der = load_gate_pubkey_der()?;
+    let (host, port) = split_host_port(&msgate, 10000);
 
     eprintln!("[gate-login] establishing session...");
-    let mut session = LiveSession::establish(&host, port, der.as_bytes())
-        .map_err(|e| ApiError::Io {
-            path: PathBuf::from(format!("{host}:{port}")),
-            source: std::io::Error::other(e.to_string()),
-        })?;
+    let mut session = LiveSession::establish(&host, port, &der).map_err(|e| ApiError::Io {
+        path: PathBuf::from(format!("{host}:{port}")),
+        source: std::io::Error::other(e.to_string()),
+    })?;
     eprintln!("[gate-login] established; the ms-gate never gets connectServer (that is world-gate only - the login gates answer it Busy by design)");
-    let key_hex: String =
-        session.key.iter().map(|b| format!("{b:02x}")).collect();
+    let key_hex = hex_encode(&session.key);
 
     // verifySdk with the banked ticket - byte-exact message shape
     eprintln!("[gate-login] calling verifySdk...");
@@ -956,6 +989,275 @@ fn gate_login(
     })
 }
 
+// ---------------------------------------------------------------------------
+// world-pull: verifySdk -> CS_Login -> bind -> world gate -> save stream
+// ---------------------------------------------------------------------------
+
+/// Execute the full login chain with a FRESH ticket, then open the world
+/// gate with connectServer{auth} and capture the save stream frames.
+///
+/// Credentials json fields: `ticket` (required), optional overrides
+/// `account_id`, `client_version`, `client_config_version`,
+/// `session_id_hex` / `gate_id_hex` (24 hex chars each), `sdk_info_json`.
+/// Everything optional falls back to the capture-decoded 2026-09-25 values
+/// or a runtime-synthesized substitute.
+fn world_pull(
+    msgate: String,
+    worldgate: String,
+    credentials: PathBuf,
+    uid: u64,
+    out: PathBuf,
+) -> Result<apiimo_api_shim::WorldPullData, ApiError> {
+    use apiimo_network::login_chain;
+    use apiimo_network::LiveSession;
+
+    let mut notes = Vec::new();
+    let creds = read_credentials(&credentials)?;
+    let ticket = creds["ticket"]
+        .as_str()
+        .ok_or_else(|| ApiError::Io {
+            path: credentials.clone(),
+            source: std::io::Error::other("credentials missing 'ticket' (run \
+                keyhound/fresh_ticket_run.py after a game boot)"),
+        })?
+        .to_string();
+    let account_id = creds["account_id"]
+        .as_str()
+        .unwrap_or("fp_account_global:2044122406")
+        .to_string();
+
+    let der = load_gate_pubkey_der()?;
+    let (ms_host, ms_port) = split_host_port(&msgate, 10000);
+
+    // --- 1. ms-gate: handshake + verifySdk ---
+    eprintln!("[world-pull] ms-gate session...");
+    let mut ms = LiveSession::establish(&ms_host, ms_port, &der).map_err(|e| ApiError::Io {
+        path: PathBuf::from(format!("{ms_host}:{ms_port}")),
+        source: std::io::Error::other(e.to_string()),
+    })?;
+    let msgate_key_hex = hex_encode(&ms.key);
+    eprintln!("[world-pull] verifySdk with fresh ticket...");
+    let verify_resp = ms
+        .verify_sdk(&ticket)
+        .map_err(|e| ApiError::Io {
+            path: PathBuf::from("verifySdk"),
+            source: std::io::Error::other(e.to_string()),
+        })?;
+    let verify_bytes = verify_resp.len();
+
+    // --- 2. extract the login-auth blob the response issues ---
+    let auth = match login_chain::extract_login_auth(&verify_resp) {
+        Some(a) => a,
+        None => {
+            notes.push(format!(
+                "verifySdk response ({verify_bytes}B) carried no recognizable \
+                 {{Username,Expired,Sign}} blob; raw: {}",
+                hex_encode(&verify_resp)
+            ));
+            return Ok(apiimo_api_shim::WorldPullData {
+                msgate: format!("{ms_host}:{ms_port}"),
+                worldgate: worldgate.clone(),
+                account_id,
+                uid,
+                verify_bytes,
+                cs_login_bytes: 0,
+                bind_bytes: 0,
+                connect_resp: None,
+                frames_captured: 0,
+                out: out.display().to_string(),
+                msgate_key_hex,
+                world_key_hex: String::new(),
+                notes,
+            });
+        }
+    };
+    notes.push(format!(
+        "login-auth: Username={} Expired={} Sign={}...",
+        auth.username,
+        auth.expired,
+        &auth.sign[..12.min(auth.sign.len())]
+    ));
+
+    // --- 3. CS_Login + PhonestGate.bind ---
+    let client_version = creds["client_version"]
+        .as_str()
+        .unwrap_or("2026092202")
+        .to_string();
+    let (client_config_version, ccv_placeholder) = match creds["client_config_version"].as_str() {
+        Some(v) => (v.to_string(), false),
+        None => ("278da592".to_string(), true),
+    };
+    if ccv_placeholder {
+        notes.push(
+            "clientConfigVersion falls back to the capture prefix - paste the \
+             full value from a live capture into the credentials json"
+                .to_string(),
+        );
+    }
+    // 12B ObjectIds: credentials override, else the handshake m19 pushes,
+    // else timestamp-synthesized.
+    let (session_id, gate_id) = object_ids(&creds, &ms.pushes);
+    let sdk_info_json = creds["sdk_info_json"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            notes.push("sdkInfo json synthesized (banked 1875B blob not supplied)".into());
+            format!(
+                "{{\"log_source\":\"pc\",\"app_id\":\"worldx.global.prod\",\
+                 \"channel_uid\":\"{}\",\"account_id\":\"{}\",\
+                 \"properties\":{{\"sdk_version\":\"28.1.1\",\
+                 \"channel_platform\":\"steam\",\"os_version\":\"Windows 10 64-bit\",\
+                 \"device_model\":\"PC\",\"language\":\"en\"}}}}",
+                creds["channel_uid"].as_str().unwrap_or("0"),
+                account_id
+            )
+        });
+    let cfg = login_chain::CsLoginConfig {
+        client_version,
+        client_config_version,
+        server_id: creds["server_id"].as_u64().unwrap_or(100),
+        scene_id: creds["DEFAULT_SCENE_ID"].as_u64().unwrap_or(3002),
+        region_no: 0,
+        session_id,
+        gate_id,
+        language: creds["language"].as_str().unwrap_or("en").to_string(),
+        sdk_info_json,
+    };
+
+    eprintln!("[world-pull] CS_Login...");
+    let cs_resp = ms.cs_login(&account_id, &auth.raw, uid, &cfg).map_err(|e| {
+        ApiError::Io {
+            path: PathBuf::from("CS_Login"),
+            source: std::io::Error::other(e.to_string()),
+        }
+    })?;
+    let cs_login_bytes = cs_resp.len();
+    eprintln!("[world-pull] PhonestGate.bind...");
+    let bind_resp = ms
+        .phonest_bind(uid)
+        .map_err(|e| ApiError::Io {
+            path: PathBuf::from("PhonestGate.bind"),
+            source: std::io::Error::other(e.to_string()),
+        })?;
+    let bind_bytes = bind_resp.len();
+
+    // --- 4. world gate: connectServer{auth} + save stream capture ---
+    let (wg_host, wg_port) = split_host_port(&worldgate, 20000);
+    eprintln!("[world-pull] world gate session...");
+    let mut world = LiveSession::establish(&wg_host, wg_port, &der).map_err(|e| ApiError::Io {
+        path: PathBuf::from(format!("{wg_host}:{wg_port}")),
+        source: std::io::Error::other(e.to_string()),
+    })?;
+    let world_key_hex = hex_encode(&world.key);
+    let connect = login_chain::world_connect_server(&auth.raw, &cfg.client_version, &[]);
+    world
+        .connect_server(&connect)
+        .map_err(|e| ApiError::Io {
+            path: PathBuf::from("connectServer"),
+            source: std::io::Error::other(e.to_string()),
+        })?;
+
+    // capture the save stream: read until the deadline, keep every frame
+    eprintln!("[world-pull] capturing save stream (12s)...");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    let mut frames: Vec<(u16, Vec<u8>)> = Vec::new();
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+        match world.read_frames(left.min(std::time::Duration::from_millis(500))) {
+            Ok(fs) => frames.extend(fs),
+            Err(_) => break,
+        }
+    }
+    let frames_captured = frames.len();
+    login_chain::write_stream_dump(&out, &frames).map_err(|e| ApiError::Io {
+        path: out.clone(),
+        source: e,
+    })?;
+    let connect_resp = frames
+        .iter()
+        .find(|(m, _)| *m == 4)
+        .and_then(|(_, b)| apiimo_network::ConnectServerResp::decode_pb(b).ok())
+        .and_then(|r| r.resp_type);
+    if let Some(t) = connect_resp {
+        notes.push(format!(
+            "connectResponse type={t} (1=connected, 0=busy, 2=refused)"
+        ));
+    }
+
+    Ok(apiimo_api_shim::WorldPullData {
+        msgate: format!("{ms_host}:{ms_port}"),
+        worldgate: format!("{wg_host}:{wg_port}"),
+        account_id,
+        uid,
+        verify_bytes,
+        cs_login_bytes,
+        bind_bytes,
+        connect_resp,
+        frames_captured,
+        out: out.display().to_string(),
+        msgate_key_hex,
+        world_key_hex,
+        notes,
+    })
+}
+
+/// 12B ObjectIds for CS_Login: credentials override, then any 12-byte
+/// bytes field the gate pushed during the handshake, else synthesized
+/// (4B seconds + 5B random + 3B counter, ObjectId style).
+fn object_ids(
+    creds: &serde_json::Value,
+    pushes: &[(u16, Vec<u8>)],
+) -> ([u8; 12], [u8; 12]) {
+    let from_hex = |v: Option<&str>| -> Option<[u8; 12]> {
+        let s = v?;
+        if s.len() != 24 {
+            return None;
+        }
+        let mut out = [0u8; 12];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        Some(out)
+    };
+    let session = from_hex(creds["session_id_hex"].as_str());
+    let gate = from_hex(creds["gate_id_hex"].as_str());
+    if let (Some(s), Some(g)) = (session, gate) {
+        return (s, g);
+    }
+    // scan handshake pushes for 12-byte protobuf bytes fields
+    let mut found = Vec::new();
+    for (_, body) in pushes {
+        if let Ok(m) = apiimo_network::pb::decode(body) {
+            for field in 1..16u32 {
+                if let Some(b) = m.bytes(field) {
+                    if b.len() == 12 {
+                        found.push(b.to_vec());
+                    }
+                }
+            }
+        }
+    }
+    if found.len() >= 2 && session.is_none() && gate.is_none() {
+        let mut s = [0u8; 12];
+        let mut g = [0u8; 12];
+        s.copy_from_slice(&found[0]);
+        g.copy_from_slice(&found[1]);
+        return (s, g);
+    }
+    // synthesize
+    let synth = || {
+        let mut v = [0u8; 12];
+        v[..4].copy_from_slice(
+            &(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as u32)
+                .to_be_bytes(),
+        );
+        v
+    };
+    (session.unwrap_or_else(synth), gate.unwrap_or_else(synth))
+}
+
 /// Small holder so the report types stay out of the public enum noise.
 pub mod apiimo_api_shim {
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -965,5 +1267,22 @@ pub mod apiimo_api_shim {
         pub session_key_hex: String,
         pub response_hex: String,
         pub response_utf8: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    pub struct WorldPullData {
+        pub msgate: String,
+        pub worldgate: String,
+        pub account_id: String,
+        pub uid: u64,
+        pub verify_bytes: usize,
+        pub cs_login_bytes: usize,
+        pub bind_bytes: usize,
+        pub connect_resp: Option<i64>,
+        pub frames_captured: usize,
+        pub out: String,
+        pub msgate_key_hex: String,
+        pub world_key_hex: String,
+        pub notes: Vec<String>,
     }
 }
