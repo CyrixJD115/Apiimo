@@ -12,6 +12,11 @@ running the full dump pipeline with the Rust `apiimo` binary reproduces
 the Python tool's `global-metadata.decrypted.dat` and `dump.cs` byte for
 byte, in about a third of the time.
 
+## Docs
+- [Legal notice](LEGAL.md) — reverse-engineering statement, bring-your-own-game rule, acceptable use, DMCA policy
+- [Notice](NOTICE.md) — short-form disclaimer and attribution
+- [License](LICENSE) — GPL-3.0
+
 ## Workspace
 
 | Crate | Scope |
