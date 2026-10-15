@@ -1,5 +1,11 @@
 # Apiimo
 
+> ⚠️ **Heavily work in progress.** Some functions work, some don't. Any
+> contribution really helps — here or in the sibling ecosystem modules
+> ([AniiModLoader](https://github.com/CyrixJD115/AniiModLoader),
+> [Serviimo](https://github.com/CyrixJD115/Serviimo)) — all coordinated from
+> [AniiStudio](https://github.com/CyrixJD115/AniiStudio).
+
 Apiimo is a Rust workspace for the Aniimo metadata and binary-analysis
 toolkit. It is a verified port of the original Python implementation:
 running the full dump pipeline with the Rust `apiimo` binary reproduces
