@@ -184,3 +184,25 @@ match apiimo.run(&Command::classes("AntiCheat"))? {
 ```bash
 cargo test --workspace
 ```
+
+## Legal notice
+
+- **Not affiliated.** This is a personal, fan-made project. It is not
+  affiliated with, endorsed by, or sponsored by the developers or publishers
+  of Aniimo. All game names, trademarks, and assets belong to their
+  respective owners.
+- **No game content is distributed.** This repository ships only original
+  code. It contains no part of the game — no binaries, assets, or data.
+- **Bring your own game.** Apiimo operates on **your own game files**,
+  obtained through your own legitimate Steam account. You are expected to
+  supply them yourself; this project never distributes game files or helps
+  anyone acquire them unlawfully.
+- **Interoperability and research.** Apiimo exists for interoperability
+  with, and personal reverse-engineering research on, your own legitimately
+  obtained copy of the game.
+- **Rights holders.** If you believe something in this repository infringes
+  your rights, please open an issue describing it; legitimate reports will
+  be reviewed and resolved promptly.
+- **No warranty.** Everything is provided "as is", without warranty of any
+  kind. You are responsible for how you use this software and for complying
+  with the game's terms of service and the laws that apply to you.
