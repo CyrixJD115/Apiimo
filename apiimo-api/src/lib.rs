@@ -23,7 +23,7 @@ pub use dumper::{
 pub use error::ApiError;
 
 use std::io::Read as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use apiimo_core::{
     default_game_dir, find_addresses, find_classes, find_fields, find_methods, find_strings,
@@ -48,6 +48,17 @@ pub(crate) fn decode_hex(s: &str) -> Result<Vec<u8>, std::num::ParseIntError> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
         .collect()
+}
+
+/// Keep the decoded inspection copy separate from the byte-preserved download.
+/// Older Apiimo builds used `.bin` for both paths and silently replaced the
+/// original compressed capture when the caller accepted the CLI default.
+fn decoded_save_path(raw_path: &Path) -> PathBuf {
+    if raw_path.extension().and_then(|value| value.to_str()) == Some("bin") {
+        raw_path.with_extension("decoded.bin")
+    } else {
+        raw_path.with_extension("bin")
+    }
 }
 
 /// One gate's liveness, as reported by `gate-status`.
@@ -494,7 +505,8 @@ impl Apiimo {
                                     "zstd decode failed: {error}"
                                 ))
                             })?;
-                        let decoded_path = out.with_extension("bin");
+                        let decoded_path = decoded_save_path(out);
+                        debug_assert_ne!(decoded_path.as_path(), out.as_path());
                         std::fs::write(&decoded_path, &plain).map_err(|source| ApiError::Io {
                             path: decoded_path.clone(),
                             source,
@@ -755,5 +767,17 @@ mod tests {
         let json = output.to_json();
         assert!(json.contains("AntiCheatResult"));
         assert!(json.contains("27781"));
+    }
+
+    #[test]
+    fn decoded_save_path_never_overwrites_raw_capture() {
+        assert_eq!(
+            decoded_save_path(Path::new("client_info_123.zst")),
+            PathBuf::from("client_info_123.bin")
+        );
+        assert_eq!(
+            decoded_save_path(Path::new("client_info_123.bin")),
+            PathBuf::from("client_info_123.decoded.bin")
+        );
     }
 }

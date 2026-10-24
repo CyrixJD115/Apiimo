@@ -158,6 +158,8 @@ the game's own `.proto` schemas are vendored under `apiimo-network/proto/`
   workspace key-hunt report).
 - Server status: a gate in maintenance answers method 19 with literal
   `FORBID`/`FORBID` and no token - `gate-status` classifies it.
+- `save-pull` preserves the compressed ClientInfo capture as `.zst` and writes
+  decoded inspection bytes to a separate `.bin` file.
 - `save-pull` downloads a client-info save blob from the world-readable
   OSS object storage without any login (own account only by convention).
 
