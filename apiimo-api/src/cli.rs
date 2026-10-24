@@ -143,7 +143,7 @@ where
             let out = args
                 .get(2)
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(format!("client_info_{uid}.bin")));
+                .unwrap_or_else(|| PathBuf::from(format!("client_info_{uid}.zst")));
             Command::SavePull { uid, out }
         }
         "gate-decrypt" => Command::GateDecrypt {
