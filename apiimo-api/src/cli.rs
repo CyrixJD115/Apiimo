@@ -95,6 +95,15 @@ where
 
     invocation.command = match name {
         "dump" => Command::Dump,
+        "key" => {
+            let force_recover = args.iter().any(|arg| arg == "--recover");
+            args.retain(|arg| arg != "--recover");
+            Command::Key {
+                metadata: args.get(1).map(PathBuf::from),
+                out: args.get(2).map(PathBuf::from),
+                force_recover,
+            }
+        }
         "discover" => Command::Discover,
         "classes" => Command::classes(arg(1, "classes <regex>")?),
         "methods" => Command::methods(arg(1, "methods <regex>")?),
@@ -147,6 +156,9 @@ where
             Command::SavePull { uid, out }
         }
         "gate-decrypt" => Command::GateDecrypt {
+            encrypted_offset: args.get(4).map(|s| s.parse::<usize>()
+                .map_err(|_| CliError::UnknownCommand("encrypted offset must be a decimal byte offset".into())))
+                .transpose()?.unwrap_or(0),
             key_hex: arg(1, "gate-decrypt <key_hex> <input> <output>")?.to_string(),
             input: PathBuf::from(arg(2, "gate-decrypt <key_hex> <input> <output>")?),
             output: PathBuf::from(arg(3, "gate-decrypt <key_hex> <input> <output>")?),
@@ -270,6 +282,25 @@ pub fn render(output: &Output) -> String {
                 "      done ({} per-image errors)",
                 report.dumper_error_count
             );
+        }
+        Output::KeyResult {
+            source,
+            key_hex,
+            out,
+        } => {
+            use std::fmt::Write;
+            if let Some(out) = out {
+                let _ = writeln!(text, "keystream written: {}", out.display());
+                let _ = writeln!(text, "  source: {source}");
+                if !key_hex.is_empty() {
+                    let _ = writeln!(text, "  length: {} bytes", key_hex.len() / 2);
+                }
+            } else if key_hex.is_empty() {
+                let _ = writeln!(text, "{source}");
+            } else {
+                // stdout carries the key and nothing else, ready for redirection
+                text = format!("{key_hex}\n");
+            }
         }
         Output::Sections(sections) => {
             use std::fmt::Write;
@@ -401,14 +432,23 @@ pub fn render(output: &Output) -> String {
             use std::fmt::Write;
             let _ = writeln!(text, "save blob for uid {uid}:");
             let _ = writeln!(text, "  url      : {url}");
-            let _ = writeln!(text, "  saved    : {} ({} bytes)", path.display(), raw_bytes);
+            let _ = writeln!(
+                text,
+                "  saved    : {} ({} bytes)",
+                path.display(),
+                raw_bytes
+            );
             let _ = writeln!(text, "  decoded  : {decoded_bytes} bytes ({format})");
         }
         Output::GateLogin(data) => {
             use std::fmt::Write;
             let _ = writeln!(text, "gate-login: connected as client to {}", data.msgate);
             let _ = writeln!(text, "  session key: {}", data.session_key_hex);
-            let _ = writeln!(text, "  verifySdk response ({} bytes):", data.response_hex.len() / 2);
+            let _ = writeln!(
+                text,
+                "  verifySdk response ({} bytes):",
+                data.response_hex.len() / 2
+            );
             for chunk in data.response_utf8.as_bytes().chunks(96) {
                 let _ = writeln!(text, "    {}", String::from_utf8_lossy(chunk));
             }
@@ -457,7 +497,11 @@ pub fn render(output: &Output) -> String {
                     "{:<46} {:<26} {}",
                     format!("{}:{}", e.host, e.port),
                     e.status,
-                    if e.detail.is_empty() { &e.purpose } else { &e.detail }
+                    if e.detail.is_empty() {
+                        &e.purpose
+                    } else {
+                        &e.detail
+                    }
                 );
             }
         }
@@ -495,6 +539,9 @@ Append --json to any command for machine-readable output.
 Most used:
   dump                           one shot: decrypt global-metadata, rebuild it,
                                  and run the dumper (dump.cs, script.json, DummyDlls)
+  key [file] [out]               print the metadata keystream only: the banked
+                                 key when one matches, statistical recovery
+                                 otherwise; --recover forces the recovery path
   discover                       show where every metadata section sits in the
                                  current build - nothing is hardcoded
   gate-status                    check every login gate: online / maintenance / down
@@ -520,7 +567,8 @@ Network (login gates & saves):
   gate-probe [host:port]         request an encryption token from one gate
   gate-handshake [host:port]     anonymous session-key exchange with a gate
   save-pull <uid> [out]          download an account's client-info save blob
-  gate-decrypt <key_hex> <in> <out>  decrypt a captured gate stream with an RC4 key
+  gate-decrypt <key_hex> <in> <out> [offset]
+                                 continuous RC4/zlib; offset marks first encrypted byte (default 0)
   world-pull <msgate> <worldgate> <creds> <uid> [out]
                                  full login chain + world-gate save stream capture
 
@@ -535,6 +583,7 @@ Options:
 Examples:
   apiimo dump                              dump the auto-found game
   APIIMO_GAME=./.Aniimo_Steam apiimo dump  dump a specific game folder
+  apiimo key > key.hex                     print the current build's keystream
   apiimo classes XCloudPipe                which classes match a name?
   apiimo addr XCloudPipeController         where do its methods live?
   apiimo gate-status                       are the login gates up?
@@ -546,6 +595,18 @@ Examples:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_offset_is_explicit_and_defaults_to_encrypted_start() {
+        for (arguments, expected) in [
+            (vec!["gate-decrypt", "abcd", "in", "out"], 0),
+            (vec!["gate-decrypt", "abcd", "in", "out", "17"], 17),
+        ] {
+            let parsed=parse(arguments).unwrap();
+            assert!(matches!(parsed.command, Command::GateDecrypt { encrypted_offset, .. } if encrypted_offset == expected));
+        }
+        assert!(parse(["gate-decrypt", "abcd", "in", "out", "-1"]).is_err());
+    }
 
     #[test]
     fn help_flags_trigger_help_only() {
@@ -567,18 +628,72 @@ mod tests {
             "Options:",
             "Examples:",
         ] {
-            assert!(text.contains(section), "usage is missing section {section:?}");
+            assert!(
+                text.contains(section),
+                "usage is missing section {section:?}"
+            );
         }
         for command in [
-            "dump", "discover", "classes", "methods", "fields", "addr", "str", "va2off",
-            "off2va", "patch", "xdf", "lua-strings", "xdf-cat", "gate-probe",
-            "gate-handshake", "save-pull", "gate-decrypt", "gate-status", "--game", "--out",
-            "--dumper", "--json",
+            "dump",
+            "key",
+            "discover",
+            "classes",
+            "methods",
+            "fields",
+            "addr",
+            "str",
+            "va2off",
+            "off2va",
+            "patch",
+            "xdf",
+            "lua-strings",
+            "xdf-cat",
+            "gate-probe",
+            "gate-handshake",
+            "save-pull",
+            "gate-decrypt",
+            "gate-status",
+            "--game",
+            "--out",
+            "--dumper",
+            "--json",
         ] {
             assert!(text.contains(command), "usage is missing {command:?}");
         }
     }
 
+    #[test]
+    fn parses_key_invocations() {
+        let invocation = parse(["key"]).unwrap();
+        assert_eq!(
+            invocation.command,
+            Command::Key {
+                metadata: None,
+                out: None,
+                force_recover: false
+            }
+        );
+
+        let invocation = parse(["key", "gm.dat", "k.hex", "--recover"]).unwrap();
+        assert_eq!(
+            invocation.command,
+            Command::Key {
+                metadata: Some(PathBuf::from("gm.dat")),
+                out: Some(PathBuf::from("k.hex")),
+                force_recover: true
+            }
+        );
+
+        let invocation = parse(["key", "--recover"]).unwrap();
+        assert_eq!(
+            invocation.command,
+            Command::Key {
+                metadata: None,
+                out: None,
+                force_recover: true
+            }
+        );
+    }
 
     #[test]
     fn parses_python_style_invocations() {

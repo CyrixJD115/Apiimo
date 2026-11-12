@@ -1,0 +1,22 @@
+[package]
+name = "apiimo-atlas"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Aniimo Homeland bridge client: loopback WebSocket JSON-RPC, durable journals, verified game mutations"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+fs2 = "0.4"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+libc = "0.2"
+time = { version = "0.3", features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3"

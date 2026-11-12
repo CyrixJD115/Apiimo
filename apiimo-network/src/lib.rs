@@ -37,6 +37,7 @@ mod rpc;
 
 pub use rc4::{rc4, decode_dispatch_frames, split_plain_prefix, DispatchFrame};
 pub use session::LiveSession;
+pub use aniimo_gate_codec::StreamDecoder;
 pub use login_chain::{bind_params, cs_login_params, extract_login_auth, world_connect_server, CsLoginConfig, LoginAuth};
 
 pub use client::{

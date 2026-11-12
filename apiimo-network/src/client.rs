@@ -98,30 +98,41 @@ pub fn write_frame(stream: &mut TcpStream, method: u16, body: &[u8]) -> std::io:
 }
 
 /// Read one frame. Returns `Ok(None)` on clean EOF at a frame boundary.
-pub fn read_frame(stream: &mut TcpStream) -> Result<Option<GateFrame>, GateError> {
+pub fn read_frame(stream: &mut impl Read) -> Result<Option<GateFrame>, GateError> {
     let mut len_buf = [0u8; 4];
-    match stream.read_exact(&mut len_buf) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error.into()),
+    // Only EOF before any header byte is a clean boundary. A truncated
+    // header must not be silently reported as an orderly disconnect.
+    loop {
+        match stream.read(&mut len_buf[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        }
     }
+    stream.read_exact(&mut len_buf[1..])?;
     let len = u32::from_le_bytes(len_buf);
-    if len > MAX_FRAME_LEN {
-        return Err(GateError::FrameTooLarge(len));
-    }
+    if len > MAX_FRAME_LEN { return Err(GateError::FrameTooLarge(len)); }
+    if len < 2 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "dispatch length below method size").into()); }
     let mut payload = vec![0u8; len as usize];
     stream.read_exact(&mut payload)?;
-    if payload.len() < 2 {
-        return Ok(Some(GateFrame {
-            method: 0,
-            body: payload,
-        }));
-    }
     let method = u16::from_le_bytes([payload[0], payload[1]]);
-    Ok(Some(GateFrame {
-        method,
-        body: payload[2..].to_vec(),
-    }))
+    Ok(Some(GateFrame { method, body: payload[2..].to_vec() }))
+}
+
+/// Recompute the remaining deadline before every underlying read, including
+/// fragmented headers/payloads. Slow byte delivery cannot reset the deadline.
+pub(crate) struct DeadlineReader<'a> {
+    pub stream: &'a mut TcpStream,
+    pub deadline: std::time::Instant,
+}
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() { return Err(std::io::ErrorKind::TimedOut.into()); }
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(bytes)
+    }
 }
 
 /// A live connection to one gate.
@@ -397,5 +408,38 @@ impl GateConnection {
             outcome.post_confirm_frames.push((true, raw));
         }
         Ok((outcome, material))
+    }
+}
+
+#[cfg(test)]
+mod frame_boundary_tests {
+    use super::*;
+    use std::io::Cursor;
+    #[test]
+    fn only_empty_header_is_clean_eof() {
+        assert!(read_frame(&mut Cursor::new([])).unwrap().is_none());
+        for prefix in [&[2u8][..], &[2,0], &[2,0,0], &[2,0,0,0,10]] {
+            assert!(matches!(read_frame(&mut Cursor::new(prefix)), Err(GateError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof));
+        }
+    }
+    #[test]
+    fn rejects_lengths_without_a_method_and_oversized_frames() {
+        for len in [0u32,1,MAX_FRAME_LEN+1] {
+            assert!(read_frame(&mut Cursor::new(len.to_le_bytes())).is_err());
+        }
+    }
+    #[test]
+    fn fragmented_plaintext_token_does_not_consume_next_phase() {
+        struct OneByte(Cursor<Vec<u8>>);
+        impl Read for OneByte {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                let len=output.len().min(1); self.0.read(&mut output[..len])
+            }
+        }
+        let mut reader=OneByte(Cursor::new(vec![4,0,0,0,10,0,8,42,0xab,0xcd]));
+        let frame=read_frame(&mut reader).unwrap().unwrap();
+        assert_eq!(frame.method,10); assert_eq!(frame.body,vec![8,42]);
+        assert_eq!(reader.0.position(),8);
+        let mut next=[0]; reader.read_exact(&mut next).unwrap(); assert_eq!(next,[0xab]);
     }
 }

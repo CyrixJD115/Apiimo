@@ -1,12 +1,10 @@
-//! RC4, the confirmed gate session cipher
-//! (`phonestcore::AlgorithmRc4` in xlua.dll).
+//! Legacy per-dispatch RC4 analysis helpers.
 //!
-//! Wire model (from `GateClientProtobufHandler::prepareData`): every
-//! dispatched message is encrypted with a FRESH RC4 key schedule - the
-//! 20-byte SHA-1 session key is KSA'd anew per frame, keystream starting
-//! at index 0. Captured streams also begin with plaintext handshake
-//! frames (and the client may resend its handshake), so the encrypted
-//! region starts only after ALL leading plaintext frames.
+//! These helpers model independently encrypted, uncompressed frames. That is
+//! not the post-handshake wire model implemented by LiveSession: continuous
+//! RC4 around continuous zlib. Use aniimo-gate-codec for that cipher and prefix
+//! evidence. Legacy frame decoding remains for explicit hypothesis comparison;
+//! plausible output does not establish the transport model or authenticate a key.
 
 /// RC4 key schedule: the initial S-box for a key.
 pub fn ksa(key: &[u8]) -> [u8; 256] {

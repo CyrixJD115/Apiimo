@@ -358,11 +358,167 @@ fn decrypt_whole(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>, CryptoError> 
     xor_repeating(ciphertext, key, 0)
 }
 
-fn candidate_is_printable(ciphertext: &[u8], positions: &[usize], candidate: u8) -> usize {
-    positions
-        .iter()
-        .filter(|&&position| printable(ciphertext[position] ^ candidate))
-        .count()
+/// Number of a residue's positions whose ciphertext byte decrypts to a
+/// printable byte under `candidate`, computed from the residue's ciphertext
+/// histogram instead of rescanning the positions.
+fn printable_counts(counts: &[usize; 256], candidate: u8) -> usize {
+    (32u32..127)
+        .map(|plain| counts[(plain as u8 ^ candidate) as usize])
+        .sum()
+}
+
+/// Pick the key byte that makes a residue's ciphertext column most often
+/// decrypt to a printable byte, from a histogram of that column's ciphertext
+/// bytes.
+///
+/// The count for a candidate is `printable_counts` over the histogram,
+/// which equals scanning the positions directly. Candidates are compared in
+/// ascending order with strict `>` from the current byte, so ties keep the
+/// earlier candidate exactly like the direct scan this replaced. Returns
+/// `current` unchanged when the best count does not clear the 90%
+/// acceptance rule.
+fn refine_printable_residue(counts: &[usize; 256], samples: usize, current: u8) -> u8 {
+    let mut best_candidate = current;
+    let mut best_count = printable_counts(counts, current);
+    for candidate in 0..=u8::MAX {
+        let count = printable_counts(counts, candidate);
+        if count > best_count {
+            best_count = count;
+            best_candidate = candidate;
+        }
+    }
+    if best_count * 10 > samples * 9 {
+        best_candidate
+    } else {
+        current
+    }
+}
+
+/// Read-only trigram key → log-probability table for the scoring phase.
+///
+/// Open addressing with linear probing and a power-of-two slot count keeps
+/// the hot lookup loop free of SipHash and per-hit logarithms. Weights are
+/// exact integer counts stored as `f64` during insertion (exact below 2^53)
+/// and finalized with the same `(count / total).ln()` expression the old
+/// `HashMap` path evaluated per lookup, so scores are bit-identical.
+struct TrigramTable {
+    /// `u32::MAX` marks an empty slot; real trigram keys are <= 0xFFFFFF.
+    keys: Vec<u32>,
+    /// Occurrence counts during insertion, log-probabilities after
+    /// [`TrigramTable::finalize`].
+    weights: Vec<f64>,
+    mask: usize,
+    shift: u32,
+    inserted: usize,
+    total: usize,
+}
+
+impl TrigramTable {
+    /// `max_distinct` bounds the number of different keys that can ever be
+    /// inserted; the slot count is the next power of two above it, keeping
+    /// the worst-case load factor under ~1.0 and typical loads near 0.25.
+    fn new(max_distinct: usize) -> Self {
+        Self::with_slots(max_distinct.max(1).next_power_of_two().max(4))
+    }
+
+    fn with_slots(slots: usize) -> Self {
+        debug_assert!(slots.is_power_of_two(), "slot count must be a power of two");
+        let bits = slots.trailing_zeros();
+        Self {
+            keys: vec![u32::MAX; slots],
+            weights: vec![0.0; slots],
+            mask: slots - 1,
+            shift: 64 - bits,
+            inserted: 0,
+            total: 0,
+        }
+    }
+
+    fn slot_of(&self, key: u32) -> usize {
+        (u64::from(key)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_shr(self.shift)) as usize
+    }
+
+    fn add(&mut self, key: u32) {
+        debug_assert!(key <= 0xFF_FFFF, "trigram keys use at most 24 bits");
+        let mut slot = self.slot_of(key);
+        let mut probed = 0;
+        while probed < self.keys.len() {
+            if self.keys[slot] == u32::MAX {
+                self.keys[slot] = key;
+                self.weights[slot] = 1.0;
+                self.inserted += 1;
+                self.total += 1;
+                return;
+            }
+            if self.keys[slot] == key {
+                self.weights[slot] += 1.0;
+                self.total += 1;
+                return;
+            }
+            slot = (slot + 1) & self.mask;
+            probed += 1;
+        }
+        // The sizing bound makes this unreachable for the recovery pipeline,
+        // but a full table must never spin; grow and retry instead.
+        self.grow();
+        self.add(key);
+    }
+
+    fn grow(&mut self) {
+        let total = self.total;
+        let old = std::mem::replace(self, TrigramTable::with_slots(self.keys.len() * 2));
+        for (key, weight) in old.keys.iter().zip(&old.weights) {
+            if *key != u32::MAX {
+                self.insert_weighted(*key, *weight);
+            }
+        }
+        self.total = total;
+    }
+
+    fn insert_weighted(&mut self, key: u32, weight: f64) {
+        let mut slot = self.slot_of(key);
+        while self.keys[slot] != u32::MAX {
+            debug_assert_ne!(
+                self.keys[slot],
+                key,
+                "re-inserting a key into a freshly built table"
+            );
+            slot = (slot + 1) & self.mask;
+        }
+        self.keys[slot] = key;
+        self.weights[slot] = weight;
+        self.inserted += 1;
+    }
+
+    /// Convert the accumulated counts into log-probabilities.
+    fn finalize(&mut self) {
+        let total = self.total as f64;
+        for slot in 0..self.keys.len() {
+            if self.keys[slot] != u32::MAX {
+                self.weights[slot] = (self.weights[slot] / total).ln();
+            }
+        }
+    }
+
+    fn logp(&self, key: u32) -> Option<f64> {
+        let mut slot = self.slot_of(key);
+        for _ in 0..self.keys.len() {
+            if self.keys[slot] == u32::MAX {
+                return None;
+            }
+            if self.keys[slot] == key {
+                return Some(self.weights[slot]);
+            }
+            slot = (slot + 1) & self.mask;
+        }
+        None
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inserted == 0
+    }
 }
 
 /// Recover a repeating XOR key using the statistical fallback from the
@@ -440,29 +596,25 @@ pub fn recover_key_with_period(ciphertext: &[u8], period: usize) -> Result<Vec<u
             break;
         }
 
+        // One histogram of ciphertext bytes per residue replaces a rescan of
+        // the whole position list for every residue and every candidate.
+        let mut histograms = vec![[0_usize; 256]; period];
+        let mut samples = vec![0_usize; period];
+        for &position in &positions {
+            let residue = position % period;
+            histograms[residue][ciphertext[position] as usize] += 1;
+            samples[residue] += 1;
+        }
+
         for (remainder, key_byte) in key.iter_mut().enumerate() {
-            let selected: Vec<usize> = positions
-                .iter()
-                .copied()
-                .filter(|position| position % period == remainder)
-                .collect();
-            if selected.len() < 100 {
+            if samples[remainder] < 100 {
                 continue;
             }
-
-            let mut best_candidate = *key_byte as usize;
-            let mut best_count =
-                candidate_is_printable(ciphertext, &selected, best_candidate as u8);
-            for candidate in 0..256 {
-                let count = candidate_is_printable(ciphertext, &selected, candidate as u8);
-                if count > best_count {
-                    best_count = count;
-                    best_candidate = candidate;
-                }
-            }
-            if best_count * 10 > selected.len() * 9 {
-                *key_byte = best_candidate as u8;
-            }
+            *key_byte = refine_printable_residue(
+                &histograms[remainder],
+                samples[remainder],
+                *key_byte,
+            );
         }
 
         decrypted = decrypt_whole(ciphertext, &key)?;
@@ -472,7 +624,7 @@ pub fn recover_key_with_period(ciphertext: &[u8], period: usize) -> Result<Vec<u
     let segment_end = 0x71_0000.min(length);
     let segment = &decrypted[segment_start..segment_end];
 
-    let mut trigrams = std::collections::HashMap::<u32, usize>::new();
+    let mut trigrams = TrigramTable::new(segment.len().saturating_sub(2));
     let mut run_start = None;
     for index in 0..=segment.len() {
         let is_printable = index < segment.len() && printable(segment[index]);
@@ -485,7 +637,7 @@ pub fn recover_key_with_period(ciphertext: &[u8], period: usize) -> Result<Vec<u
                         let value = (u32::from(segment[offset]) << 16)
                             | (u32::from(segment[offset + 1]) << 8)
                             | u32::from(segment[offset + 2]);
-                        *trigrams.entry(value).or_default() += 1;
+                        trigrams.add(value);
                     }
                 }
                 run_start = None;
@@ -495,7 +647,10 @@ pub fn recover_key_with_period(ciphertext: &[u8], period: usize) -> Result<Vec<u
     }
 
     if !trigrams.is_empty() {
-        let total: usize = trigrams.values().sum();
+        // A residue needs 200+ positions inside the segment starting at
+        // 0x70000; at the production period (1152) a full-size file yields
+        // ~6,000 positions per residue, so this phase runs on real builds.
+        trigrams.finalize();
         let default_log_probability = 1e-9_f64.ln();
         let positions_for = |remainder: usize| -> Vec<usize> {
             let mut positions = Vec::new();
@@ -508,13 +663,18 @@ pub fn recover_key_with_period(ciphertext: &[u8], period: usize) -> Result<Vec<u
             }
             positions
         };
+        // The candidate is a key byte; the byte placed into the scored
+        // context must be the plaintext it would produce at that position,
+        // not the raw candidate, because the trigram table is built from
+        // decrypted text.
         let score = |positions: &[usize], candidate: u8| -> f64 {
             let mut result = 0.0;
             for &position in positions {
+                let middle = ciphertext[position] ^ candidate;
                 let context = [
                     decrypted[position - 2],
                     decrypted[position - 1],
-                    candidate,
+                    middle,
                     decrypted[position + 1],
                     decrypted[position + 2],
                 ];
@@ -530,11 +690,7 @@ pub fn recover_key_with_period(ciphertext: &[u8], period: usize) -> Result<Vec<u
                         | u32::from(context[4]),
                 ];
                 for value in values {
-                    let probability = trigrams
-                        .get(&value)
-                        .map(|count| (*count as f64 / total as f64).ln())
-                        .unwrap_or(default_log_probability);
-                    result += probability;
+                    result += trigrams.logp(value).unwrap_or(default_log_probability);
                 }
             }
             result
@@ -545,6 +701,12 @@ pub fn recover_key_with_period(ciphertext: &[u8], period: usize) -> Result<Vec<u
             if positions.len() < 200 {
                 continue;
             }
+            // One ciphertext-byte histogram per residue replaces a rescan of
+            // the positions for every candidate's printable filter.
+            let mut counts = [0_usize; 256];
+            for &index in &positions {
+                counts[ciphertext[index] as usize] += 1;
+            }
 
             let mut best_candidate = *key_byte;
             let mut best_score = score(&positions, best_candidate);
@@ -552,11 +714,7 @@ pub fn recover_key_with_period(ciphertext: &[u8], period: usize) -> Result<Vec<u
                 if candidate == best_candidate {
                     continue;
                 }
-                let printable_count = positions
-                    .iter()
-                    .filter(|&&index| printable(ciphertext[index] ^ candidate))
-                    .count();
-                if printable_count * 100 < positions.len() * 93 {
+                if printable_counts(&counts, candidate) * 100 < positions.len() * 93 {
                     continue;
                 }
                 let candidate_score = score(&positions, candidate);
@@ -865,5 +1023,156 @@ mod tests {
                 VERSION.to_le_bytes()[index]
             );
         }
+    }
+
+    /// The histogram-based printable selection must reproduce the original
+    /// per-residue direct scan exactly, including ties, the <100-sample skip
+    /// and the 90% acceptance rule.
+    #[test]
+    fn printable_refinement_histogram_matches_direct_scan() {
+        let mut state = 0x243f_6a88_85a3_08d3_u64;
+        for round in 0..24 {
+            let period = [3_usize, 7, 16, 64][round % 4];
+            let len = 0x4_000;
+            let ciphertext: Vec<u8> = (0..len)
+                .map(|_| {
+                    let raw = lcg_byte(&mut state);
+                    if raw % 3 == 0 {
+                        raw
+                    } else {
+                        raw % 95 + 32
+                    }
+                })
+                .collect();
+            let positions: Vec<usize> = (0..len)
+                .filter(|_| lcg_byte(&mut state) & 1 == 0)
+                .collect();
+            let current: Vec<u8> = (0..period).map(|_| lcg_byte(&mut state)).collect();
+
+            let mut reference = current.clone();
+            for (remainder, key_byte) in reference.iter_mut().enumerate() {
+                let selected: Vec<usize> = positions
+                    .iter()
+                    .copied()
+                    .filter(|position| position % period == remainder)
+                    .collect();
+                if selected.len() < 100 {
+                    continue;
+                }
+                let mut best_candidate = *key_byte as usize;
+                let mut best_count = selected
+                    .iter()
+                    .filter(|&&position| printable(ciphertext[position] ^ best_candidate as u8))
+                    .count();
+                for candidate in 0..256 {
+                    let count = selected
+                        .iter()
+                        .filter(|&&position| printable(ciphertext[position] ^ candidate as u8))
+                        .count();
+                    if count > best_count {
+                        best_count = count;
+                        best_candidate = candidate;
+                    }
+                }
+                if best_count * 10 > selected.len() * 9 {
+                    *key_byte = best_candidate as u8;
+                }
+            }
+
+            let mut histograms = vec![[0_usize; 256]; period];
+            let mut samples = vec![0_usize; period];
+            for &position in &positions {
+                histograms[position % period][ciphertext[position] as usize] += 1;
+                samples[position % period] += 1;
+            }
+            let mut actual = current.clone();
+            for (remainder, key_byte) in actual.iter_mut().enumerate() {
+                if samples[remainder] < 100 {
+                    continue;
+                }
+                *key_byte = refine_printable_residue(
+                    &histograms[remainder],
+                    samples[remainder],
+                    *key_byte,
+                );
+            }
+            assert_eq!(actual, reference, "round {round}, period {period}");
+        }
+    }
+
+    /// The trigram phase needs 200+ segment positions per residue. This
+    /// fixture is sized so the segment [0x70000, min(0x710000, len)) is one
+    /// 4 KiB block and period 16 yields 256 positions per residue, keeping
+    /// the test fast. Residue 5 is seeded wrong on purpose: its text
+    /// positions always hold 'a', so a wrong key byte that still decrypts
+    /// every one of them to a printable letter ties the printable phase and
+    /// survives it. Only trigram context can repair that byte, which is
+    /// exactly what the phase is for.
+    #[test]
+    fn trigram_phase_repairs_a_printable_but_contextually_wrong_key_byte() {
+        let period = 16;
+        let len = 0x71_000;
+        let key: Vec<u8> = (0..period as u32).map(|index| (index * 37 + 11) as u8).collect();
+        let mut plain = vec![0_u8; len];
+        let base = b"aara ";
+        // The printable window [0x60000, 0x740000) is clamped to this file;
+        // fill all of it with text so every block is good.
+        for offset in 0x60_000..len {
+            plain[offset] = base[(offset - 0x60_000) % base.len()];
+        }
+        for offset in (5..len).step_by(period) {
+            if plain[offset] != 0 {
+                plain[offset] = b'a';
+            } else {
+                // Seed bait: 0xFF becomes the majority byte of residue 5, so
+                // the frequency pass seeds this residue wrong on purpose.
+                plain[offset] = 0xFF;
+            }
+        }
+        plain[0..4].copy_from_slice(&SANITY.to_le_bytes());
+        plain[4..8].copy_from_slice(&VERSION.to_le_bytes());
+        let ciphertext = xor_repeating(&plain, &key, 0).unwrap();
+
+        let recovered = recover_key_with_period(&ciphertext, period).unwrap();
+        assert_eq!(recovered, key);
+    }
+
+    #[test]
+    fn trigram_table_matches_hashmap_semantics() {
+        // Edge keys: all-zero bytes and the largest 24-bit key must coexist
+        // with the u32::MAX empty marker.
+        let mut table = TrigramTable::new(4);
+        assert!(table.is_empty());
+        for key in [0x0000_0000_u32, 0x00FF_FFFF, 0x00FF_FFFF, 0x0061_6263] {
+            table.add(key);
+        }
+        assert!(!table.is_empty());
+        table.finalize();
+        // Occurrences: 0x000000 -> 1, 0xFFFFFF -> 2, "abc" -> 1, total 4.
+        let reference = |count: f64| (count / 4.0_f64).ln();
+        assert_eq!(table.logp(0x0000_0000), Some(reference(1.0)));
+        assert_eq!(table.logp(0x00FF_FFFF), Some(reference(2.0)));
+        assert_eq!(table.logp(0x0061_6263), Some(reference(1.0)));
+        assert_eq!(table.logp(0x0061_6264), None);
+        assert_eq!(table.logp(0x0100_0000), None);
+    }
+
+    #[test]
+    fn trigram_table_survives_full_slot_collision_pressure() {
+        // Four slots, five distinct keys: the table must stay correct by
+        // probing even when occupancy forces long probe chains.
+        let mut table = TrigramTable::new(4);
+        for key in 0_u32..5 {
+            for _ in 0..=key {
+                table.add(key);
+            }
+        }
+        table.finalize();
+        let total: f64 = (0..=4).map(|key| f64::from(key) + 1.0).sum();
+        for key in 0_u32..5 {
+            let expected = ((f64::from(key) + 1.0) / total).ln();
+            assert_eq!(table.logp(key), Some(expected), "key {key}");
+        }
+        assert_eq!(table.logp(5), None);
     }
 }

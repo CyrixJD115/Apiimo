@@ -116,23 +116,33 @@ impl PeImage {
         &self.data
     }
 
-    /// Convert an image VA to a raw file offset.
+    /// Convert a section VA to a raw file offset. Zero-filled virtual
+    /// tails have no file bytes; raw alignment padding does.
     pub fn va_to_file_offset(&self, va: u64) -> Option<usize> {
+        self.file_range_at_va(va, 1)
+    }
+
+    /// Require the entire range to be backed by one section and the file.
+    fn file_range_at_va(&self, va: u64, len: usize) -> Option<usize> {
         let rva = va.checked_sub(self.image_base)?;
         self.sections.iter().find_map(|section| {
-            let start = u64::from(section.virtual_address);
-            let end = start.checked_add(u64::from(section.virtual_size))?;
-            if (start..end).contains(&rva) {
-                let offset = u64::from(section.raw_pointer).checked_add(rva - start)?;
-                usize::try_from(offset).ok()
-            } else {
-                None
+            let delta = rva.checked_sub(u64::from(section.virtual_address))?;
+            let raw_size = u64::from(section.raw_size);
+            if delta >= raw_size || u64::try_from(len).ok()? > raw_size - delta {
+                return None;
             }
+            let offset = usize::try_from(u64::from(section.raw_pointer).checked_add(delta)?).ok()?;
+            // Even an empty patch must start at a file-backed byte.
+            (offset < self.data.len() && offset.checked_add(len)? <= self.data.len())
+                .then_some(offset)
         })
     }
 
     /// Convert a raw file offset to an image VA.
     pub fn file_offset_to_va(&self, offset: usize) -> Option<u64> {
+        if offset >= self.data.len() {
+            return None;
+        }
         let offset = u64::try_from(offset).ok()?;
         self.sections.iter().find_map(|section| {
             let start = u64::from(section.raw_pointer);
@@ -152,8 +162,8 @@ impl PeImage {
     /// testing or a caller can write [`Self::data`] itself.
     pub fn patch(&mut self, va: u64, bytes: &[u8]) -> Result<usize, Error> {
         let offset = self
-            .va_to_file_offset(va)
-            .ok_or_else(|| Error::InvalidPe(format!("VA {va:#x} is not mapped")))?;
+            .file_range_at_va(va, bytes.len())
+            .ok_or_else(|| Error::InvalidPe(format!("patch at VA {va:#x} is not backed by one file section")))?;
         let end = offset
             .checked_add(bytes.len())
             .ok_or_else(|| Error::InvalidPe("patch exceeds addressable file size".into()))?;
@@ -245,5 +255,50 @@ mod tests {
         assert_eq!(image.file_offset_to_va(0x205), Some(va));
         assert_eq!(image.patch_hex(va, "AA bb").unwrap(), 0x205);
         assert_eq!(&image.data()[0x205..0x207], &[0xaa, 0xbb]);
+    }
+
+    fn sparse_image() -> PeImage {
+        PeImage {
+            path: None,
+            data: vec![0x55; 0x800],
+            image_base: 0x1_8000_0000,
+            sections: vec![PeSection {
+                virtual_address: 0x1000,
+                virtual_size: 0x1000,
+                raw_pointer: 0x200,
+                raw_size: 0x200,
+            }],
+        }
+    }
+
+    #[test]
+    fn zero_filled_memory_has_no_file_offset() {
+        let image = sparse_image();
+        assert_eq!(image.va_to_file_offset(image.image_base + 0x11ff), Some(0x3ff));
+        assert_eq!(image.va_to_file_offset(image.image_base + 0x1200), None);
+    }
+
+    #[test]
+    fn patch_cannot_cross_into_virtual_tail_or_file_overlay() {
+        let mut image = sparse_image();
+        let before = image.data.clone();
+        assert!(image.patch(image.image_base + 0x11ff, &[1, 2]).is_err());
+        assert_eq!(image.data, before);
+    }
+
+    #[test]
+    fn truncated_raw_sections_do_not_map_outside_file() {
+        let mut image = sparse_image();
+        image.data.truncate(0x280);
+        assert_eq!(image.va_to_file_offset(image.image_base + 0x1080), None);
+        assert_eq!(image.file_offset_to_va(0x280), None);
+    }
+
+    #[test]
+    fn raw_alignment_padding_round_trips() {
+        let mut image = sparse_image();
+        image.sections[0].virtual_size = 0x100;
+        let va = image.file_offset_to_va(0x380).unwrap();
+        assert_eq!(image.va_to_file_offset(va), Some(0x380));
     }
 }

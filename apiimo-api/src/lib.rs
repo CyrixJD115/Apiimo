@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use apiimo_core::{
     default_game_dir, find_addresses, find_classes, find_fields, find_methods, find_strings,
-    load_script, output_path, run_dump, AddressMatch, ClassMatch, DumpReport, DumpOptions,
+    load_script, output_path, run_dump, AddressMatch, ClassMatch, DumpOptions, DumpReport,
     MethodMatch, PeImage, StringLiteralMatch,
 };
 use serde::{Deserialize, Serialize};
@@ -120,6 +120,15 @@ pub mod limits {
 pub enum Command {
     /// Full decrypt -> rebuild -> sanitize -> Il2CppDumper pipeline.
     Dump,
+    /// Print the metadata keystream only: the banked key when one matches
+    /// the build, statistical recovery otherwise. `metadata` defaults to
+    /// the game root's global-metadata.dat; `out` optionally writes the
+    /// hex to a file; `--recover` skips the banked lookup on purpose.
+    Key {
+        metadata: Option<PathBuf>,
+        out: Option<PathBuf>,
+        force_recover: bool,
+    },
     /// Experimental string-table section rediscovery.
     Discover,
     /// List classes/structs/interfaces matching a case-insensitive regex.
@@ -173,6 +182,8 @@ pub enum Command {
         key_hex: String,
         input: PathBuf,
         output: PathBuf,
+        /// Offset of the first encrypted byte; preceding bytes are not guessed or decoded.
+        encrypted_offset: usize,
     },
     /// Become the client: full handshake + LoginService.verifySdk with the
     /// banked FPX credentials, printing the login response.
@@ -251,6 +262,15 @@ pub enum Output {
     GateLogin(apiimo_api_shim::GateLoginData),
     WorldPull(Box<apiimo_api_shim::WorldPullData>),
     Dump(Box<DumpReport>),
+    /// The keystream of a metadata file: which banked build key matched, or
+    /// that statistical recovery produced it. `key_hex` is empty when the
+    /// file is not encrypted. Without `out`, rendering prints the hex alone
+    /// so stdout can be redirected straight into a key file.
+    KeyResult {
+        source: String,
+        key_hex: String,
+        out: Option<PathBuf>,
+    },
     Sections(Vec<SectionEntry>),
     Classes(Vec<ClassMatch>),
     Methods(Vec<MethodMatch>),
@@ -298,7 +318,9 @@ pub enum Output {
         frames: Vec<String>,
     },
     /// Liveness of every known production game gate.
-    GateStatusTable { entries: Vec<GateStatusRow> },
+    GateStatusTable {
+        entries: Vec<GateStatusRow>,
+    },
     /// Raw bytes of one XDF entry.
     XdfBytes(Vec<u8>),
     /// Printable constant strings of one LuaJIT entry, with the chunk's
@@ -371,6 +393,82 @@ impl Apiimo {
     pub fn run(&self, command: &Command) -> Result<Output, ApiError> {
         match command {
             Command::Dump => self.run_dump_with_fallback(),
+            Command::Key {
+                metadata,
+                out,
+                force_recover,
+            } => {
+                let path = metadata
+                    .clone()
+                    .unwrap_or_else(|| apiimo_core::metadata_path(&self.game_dir));
+                let raw = std::fs::read(&path).map_err(|source| ApiError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                if raw.len() < apiimo_crypto::HEADER_SIZE {
+                    return Err(ApiError::Core(apiimo_core::Error::InvalidMetadata(
+                        format!(
+                            "metadata is shorter than the {}-byte header",
+                            apiimo_crypto::HEADER_SIZE
+                        ),
+                    )));
+                }
+                let version =
+                    u32::from_le_bytes(raw[4..8].try_into().expect("length checked above"));
+                if version == apiimo_crypto::VERSION {
+                    return Ok(Output::KeyResult {
+                        source: "not encrypted - the file already carries a vanilla header".into(),
+                        key_hex: String::new(),
+                        out: out.clone(),
+                    });
+                }
+                let recovered = |raw: &[u8]| {
+                    apiimo_crypto::recover_key_refined(raw)
+                        .map_err(|error| ApiError::Core(error.into()))
+                };
+                let (key, source) = if *force_recover {
+                    eprintln!(
+                        "apiimo: --recover set; running statistical recovery \
+                         (about a minute on a 28 MB build)..."
+                    );
+                    (
+                        recovered(&raw)?,
+                        "statistical recovery (--recover forced)".to_string(),
+                    )
+                } else {
+                    match apiimo_crypto::select_embedded_key(&raw) {
+                        Some(banked) => {
+                            let tag = apiimo_crypto::embedded_key_tag(banked)
+                                .unwrap_or_else(|| "unknown build".into());
+                            (banked.to_vec(), format!("embedded key matched: {tag}"))
+                        }
+                        None => {
+                            eprintln!(
+                                "apiimo: no embedded key matches; running statistical \
+                                 recovery (about a minute on a 28 MB build)..."
+                            );
+                            (
+                                recovered(&raw)?,
+                                "statistical recovery (new build)".to_string(),
+                            )
+                        }
+                    }
+                };
+                let key_hex = hex(&key);
+                if let Some(out) = out {
+                    std::fs::write(out, format!("{key_hex}\n")).map_err(|source| ApiError::Io {
+                        path: out.clone(),
+                        source,
+                    })?;
+                } else {
+                    eprintln!("apiimo: {source} ({} bytes)", key.len());
+                }
+                Ok(Output::KeyResult {
+                    source,
+                    key_hex,
+                    out: out.clone(),
+                })
+            }
             Command::Discover => {
                 let metadata_file = apiimo_core::metadata_path(&self.game_dir);
                 let raw = std::fs::read(&metadata_file).map_err(|source| ApiError::Io {
@@ -477,12 +575,11 @@ impl Apiimo {
                 Ok(Output::XdfBytes(xdf.read(entry)?))
             }
             Command::GateHandshake { host, port } => {
-                let key_der = std::fs::read(self.gate_key_path()).map_err(|source| {
-                    ApiError::Io {
+                let key_der =
+                    std::fs::read(self.gate_key_path()).map_err(|source| ApiError::Io {
                         path: self.gate_key_path(),
                         source,
-                    }
-                })?;
+                    })?;
                 let mut conn = apiimo_network::GateConnection::connect(
                     host,
                     *port,
@@ -499,7 +596,9 @@ impl Apiimo {
                     frames: outcome
                         .post_confirm_frames
                         .into_iter()
-                        .map(|(ours, bytes)| format!("{} {}", if ours { "C" } else { "S" }, hex(&bytes)))
+                        .map(|(ours, bytes)| {
+                            format!("{} {}", if ours { "C" } else { "S" }, hex(&bytes))
+                        })
                         .collect(),
                 })
             }
@@ -580,6 +679,7 @@ impl Apiimo {
                 key_hex,
                 input,
                 output,
+                encrypted_offset,
             } => {
                 let key = decode_hex(key_hex).map_err(|error| {
                     apiimo_network::NetworkError::Xdf(format!("bad key hex: {error:?}"))
@@ -589,45 +689,30 @@ impl Apiimo {
                     source,
                 })?;
                 let input_len = data.len();
-                // Captured streams begin with plaintext handshake frames
-                // (the client may resend its handshake); strip them, then
-                // decode the remainder with a fresh key schedule per frame
-                // (the gate re-keys every dispatched message).
-                let (plain, rest) = apiimo_network::split_plain_prefix(&data, 16);
-                let decoded = apiimo_network::decode_dispatch_frames(&key, rest, 64);
+                let encrypted = data.get(*encrypted_offset..).ok_or_else(||
+                    apiimo_network::NetworkError::Xdf("encrypted offset exceeds input length".into()))?;
+                let mut decoder = apiimo_network::StreamDecoder::new(&key)
+                    .map_err(|e| apiimo_network::NetworkError::Xdf(e.into()))?;
+                let mut decoded = Vec::new();
+                for chunk in encrypted.chunks(65536) {
+                    decoded.extend(decoder.feed(chunk).map_err(|e| apiimo_network::NetworkError::Xdf(e.into()))?);
+                }
+                if decoded.is_empty() || decoder.pending_frame_bytes() != 0 || decoder.pending_compressed_bytes() != 0 {
+                    return Err(apiimo_network::NetworkError::Xdf("capture has no complete frames or ends with partial data".into()).into());
+                }
                 let mut out_bytes = Vec::new();
                 let mut frame_codecs = Vec::new();
-                for (index, frame) in decoded.iter().enumerate() {
-                    // The gate compresses every body before encrypting it
-                    // (zlib by default, zstd when negotiated); undo that so
-                    // the output stream holds parseable protobuf bodies.
-                    let (body, codec) = decompress_body(&frame.body);
+                for (method, body) in &decoded {
                     out_bytes.extend_from_slice(&((body.len() + 2) as u32).to_le_bytes());
-                    out_bytes.extend_from_slice(&frame.method.to_le_bytes());
-                    out_bytes.extend_from_slice(&body);
-                    let preview = if index < 8 {
-                        format!(" {}", hex(&body[..body.len().min(32)]))
-                    } else {
-                        String::new()
-                    };
-                    frame_codecs.push(format!(
-                        "m{} {}B {}->{}B{}",
-                        frame.method,
-                        frame.body.len(),
-                        codec,
-                        body.len(),
-                        preview
-                    ));
+                    out_bytes.extend_from_slice(&method.to_le_bytes());
+                    out_bytes.extend_from_slice(body);
+                    frame_codecs.push(format!("m{method} {}B continuous RC4/zlib", body.len()));
                 }
                 std::fs::write(output, &out_bytes).map_err(|source| ApiError::Io {
                     path: output.clone(),
                     source,
                 })?;
-                let frames: Vec<String> = plain
-                    .iter()
-                    .map(|f| format!("plain m{} {}B", f.method, f.body.len()))
-                    .chain(frame_codecs.into_iter())
-                    .collect();
+                let frames = frame_codecs;
                 Ok(Output::GateDecryptResult {
                     key_bytes: key.len(),
                     input_bytes: input_len,
@@ -664,52 +749,43 @@ impl Apiimo {
                     }
                     let port = endpoint.port.unwrap_or(10000);
                     let host = endpoint.host;
-                    let (status, token, detail) =
-                        match apiimo_network::GateConnection::connect(
-                            host,
-                            port,
-                            std::time::Duration::from_secs(4),
-                        ) {
-                            Ok(mut conn) => match conn.probe(4) {
-                                Ok(result) => {
-                                    let status = match result.status() {
-                                        GateState::Up => "UP",
-                                        GateState::Forbidden => "FORBIDDEN (maintenance)",
-                                        GateState::NoResponse => "NO RESPONSE",
-                                    };
-                                    let detail = result
-                                        .gate_info
-                                        .as_ref()
-                                        .map(|info| {
-                                            let f1 = info
-                                                .bytes(1)
-                                                .map(|b| String::from_utf8_lossy(b).into_owned())
-                                                .unwrap_or_default();
-                                            let f2 = info
-                                                .bytes(2)
-                                                .map(|b| String::from_utf8_lossy(b).into_owned())
-                                                .unwrap_or_default();
-                                            format!("gate-info: {f1:?} / {f2:?}")
-                                        })
-                                        .unwrap_or_default();
-                                    (
-                                        status,
-                                        result.encrypt_token.as_ref().map(|t| t.token),
-                                        detail,
-                                    )
-                                }
-                                Err(error) => (
-                                    "PROBE ERROR",
-                                    None,
-                                    format!("{error}"),
-                                ),
-                            },
-                            Err(error) => (
-                                "UNREACHABLE",
-                                None,
-                                format!("{error}"),
-                            ),
-                        };
+                    let (status, token, detail) = match apiimo_network::GateConnection::connect(
+                        host,
+                        port,
+                        std::time::Duration::from_secs(4),
+                    ) {
+                        Ok(mut conn) => match conn.probe(4) {
+                            Ok(result) => {
+                                let status = match result.status() {
+                                    GateState::Up => "UP",
+                                    GateState::Forbidden => "FORBIDDEN (maintenance)",
+                                    GateState::NoResponse => "NO RESPONSE",
+                                };
+                                let detail = result
+                                    .gate_info
+                                    .as_ref()
+                                    .map(|info| {
+                                        let f1 = info
+                                            .bytes(1)
+                                            .map(|b| String::from_utf8_lossy(b).into_owned())
+                                            .unwrap_or_default();
+                                        let f2 = info
+                                            .bytes(2)
+                                            .map(|b| String::from_utf8_lossy(b).into_owned())
+                                            .unwrap_or_default();
+                                        format!("gate-info: {f1:?} / {f2:?}")
+                                    })
+                                    .unwrap_or_default();
+                                (
+                                    status,
+                                    result.encrypt_token.as_ref().map(|t| t.token),
+                                    detail,
+                                )
+                            }
+                            Err(error) => ("PROBE ERROR", None, format!("{error}")),
+                        },
+                        Err(error) => ("UNREACHABLE", None, format!("{error}")),
+                    };
                     entries.push(GateStatusRow {
                         host: host.to_string(),
                         port,
@@ -781,9 +857,7 @@ impl Apiimo {
     fn gate_key_path(&self) -> PathBuf {
         std::env::var("APIIMO_GATE_KEY")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from("../.captures/gate_rsa/gate_rsa_2048.der")
-            })
+            .unwrap_or_else(|_| PathBuf::from("../.captures/gate_rsa/gate_rsa_2048.der"))
     }
 
     fn dump_cs(&self) -> Result<PathBuf, ApiError> {
@@ -818,9 +892,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn key_command_reports_the_matching_banked_keystream() {
+        // A synthetic encrypted build: printable plaintext large enough to
+        // cover the selector window, XORed with the first banked keystream.
+        // The command must select that build and echo its key exactly.
+        let banked_key = apiimo_crypto::build_keys()[0].key.clone();
+        let plaintext: Vec<u8> = b"Aniimo key-command test plaintext. "
+            .iter()
+            .copied()
+            .cycle()
+            .take(0x70000)
+            .collect();
+        let ciphertext =
+            apiimo_crypto::xor_repeating(&plaintext, &banked_key, 0).expect("xor is total");
+        let path = std::env::temp_dir().join(format!("apiimo-key-test-{}.dat", std::process::id()));
+        std::fs::write(&path, &ciphertext).expect("write temp ciphertext");
+        let output = Apiimo::discover()
+            .run(&Command::Key {
+                metadata: Some(path.clone()),
+                out: None,
+                force_recover: false,
+            })
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        let Output::KeyResult {
+            source,
+            key_hex,
+            out,
+        } = output
+        else {
+            panic!("expected KeyResult, got {output:?}");
+        };
+        assert!(out.is_none());
+        assert!(source.contains("embedded key matched"), "{source}");
+        assert_eq!(key_hex, hex(&banked_key));
+    }
+
+    #[test]
+    #[ignore = "point APIIMO_TEST_METADATA at a real encrypted global-metadata.dat"]
+    fn key_command_matches_banked_key_on_real_metadata() {
+        let Ok(path) = std::env::var("APIIMO_TEST_METADATA") else {
+            return;
+        };
+        let output = Apiimo::discover()
+            .run(&Command::Key {
+                metadata: Some(path.into()),
+                out: None,
+                force_recover: false,
+            })
+            .unwrap();
+        let Output::KeyResult {
+            source, key_hex, ..
+        } = output
+        else {
+            panic!("expected KeyResult, got {output:?}");
+        };
+        assert!(source.contains("embedded key matched"), "{source}");
+        assert!(apiimo_crypto::build_keys()
+            .iter()
+            .any(|build| hex(&build.key) == key_hex));
+    }
+
+    #[test]
     fn decompress_body_detects_zlib_and_falls_through() {
         use std::io::Write as _;
-        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(b"hello save body").unwrap();
         let zlib_frame = encoder.finish().unwrap();
         let (out, codec) = decompress_body(&zlib_frame);
@@ -881,9 +1018,7 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 /// Read + parse a credentials json (ticket, account_id, channel_uid, ...).
-fn read_credentials(
-    path: &PathBuf,
-) -> Result<serde_json::Value, ApiError> {
+fn read_credentials(path: &PathBuf) -> Result<serde_json::Value, ApiError> {
     let raw = std::fs::read_to_string(path).map_err(|source| ApiError::Io {
         path: path.clone(),
         source,
@@ -910,11 +1045,10 @@ fn load_gate_pubkey_der() -> Result<Vec<u8>, ApiError> {
             path: xdf_path,
             source: std::io::Error::other(e.to_string()),
         })?;
-    let conf_json: serde_json::Value =
-        serde_json::from_slice(&conf).map_err(|e| ApiError::Io {
-            path: PathBuf::from("conf.json"),
-            source: std::io::Error::other(e.to_string()),
-        })?;
+    let conf_json: serde_json::Value = serde_json::from_slice(&conf).map_err(|e| ApiError::Io {
+        path: PathBuf::from("conf.json"),
+        source: std::io::Error::other(e.to_string()),
+    })?;
     let pem = conf_json["pubKeyData"]
         .as_str()
         .ok_or_else(|| ApiError::Io {
@@ -972,12 +1106,10 @@ fn gate_login(
 
     // verifySdk with the banked ticket - byte-exact message shape
     eprintln!("[gate-login] calling verifySdk...");
-    let resp = session
-        .verify_sdk(&ticket)
-        .map_err(|e| ApiError::Io {
-            path: PathBuf::from("verifySdk"),
-            source: std::io::Error::other(e.to_string()),
-        })?;
+    let resp = session.verify_sdk(&ticket).map_err(|e| ApiError::Io {
+        path: PathBuf::from("verifySdk"),
+        source: std::io::Error::other(e.to_string()),
+    })?;
 
     let response_utf8 = String::from_utf8_lossy(&resp).to_string();
     Ok(apiimo_api_shim::GateLoginData {
@@ -1017,8 +1149,10 @@ fn world_pull(
         .as_str()
         .ok_or_else(|| ApiError::Io {
             path: credentials.clone(),
-            source: std::io::Error::other("credentials missing 'ticket' (run \
-                keyhound/fresh_ticket_run.py after a game boot)"),
+            source: std::io::Error::other(
+                "credentials missing 'ticket' (run \
+                keyhound/fresh_ticket_run.py after a game boot)",
+            ),
         })?
         .to_string();
     let account_id = creds["account_id"]
@@ -1037,12 +1171,10 @@ fn world_pull(
     })?;
     let msgate_key_hex = hex_encode(&ms.key);
     eprintln!("[world-pull] verifySdk with fresh ticket...");
-    let verify_resp = ms
-        .verify_sdk(&ticket)
-        .map_err(|e| ApiError::Io {
-            path: PathBuf::from("verifySdk"),
-            source: std::io::Error::other(e.to_string()),
-        })?;
+    let verify_resp = ms.verify_sdk(&ticket).map_err(|e| ApiError::Io {
+        path: PathBuf::from("verifySdk"),
+        source: std::io::Error::other(e.to_string()),
+    })?;
     let verify_bytes = verify_resp.len();
 
     // --- 2. extract the login-auth blob the response issues ---
@@ -1125,20 +1257,18 @@ fn world_pull(
     };
 
     eprintln!("[world-pull] CS_Login...");
-    let cs_resp = ms.cs_login(&account_id, &auth.raw, uid, &cfg).map_err(|e| {
-        ApiError::Io {
+    let cs_resp = ms
+        .cs_login(&account_id, &auth.raw, uid, &cfg)
+        .map_err(|e| ApiError::Io {
             path: PathBuf::from("CS_Login"),
             source: std::io::Error::other(e.to_string()),
-        }
-    })?;
+        })?;
     let cs_login_bytes = cs_resp.len();
     eprintln!("[world-pull] PhonestGate.bind...");
-    let bind_resp = ms
-        .phonest_bind(uid)
-        .map_err(|e| ApiError::Io {
-            path: PathBuf::from("PhonestGate.bind"),
-            source: std::io::Error::other(e.to_string()),
-        })?;
+    let bind_resp = ms.phonest_bind(uid).map_err(|e| ApiError::Io {
+        path: PathBuf::from("PhonestGate.bind"),
+        source: std::io::Error::other(e.to_string()),
+    })?;
     let bind_bytes = bind_resp.len();
 
     // --- 4. world gate: connectServer{auth} + save stream capture ---
@@ -1150,12 +1280,10 @@ fn world_pull(
     })?;
     let world_key_hex = hex_encode(&world.key);
     let connect = login_chain::world_connect_server(&auth.raw, &cfg.client_version, &[]);
-    world
-        .connect_server(&connect)
-        .map_err(|e| ApiError::Io {
-            path: PathBuf::from("connectServer"),
-            source: std::io::Error::other(e.to_string()),
-        })?;
+    world.connect_server(&connect).map_err(|e| ApiError::Io {
+        path: PathBuf::from("connectServer"),
+        source: std::io::Error::other(e.to_string()),
+    })?;
 
     // capture the save stream: read until the deadline, keep every frame
     eprintln!("[world-pull] capturing save stream (12s)...");
@@ -1203,10 +1331,7 @@ fn world_pull(
 /// 12B ObjectIds for CS_Login: credentials override, then any 12-byte
 /// bytes field the gate pushed during the handshake, else synthesized
 /// (4B seconds + 5B random + 3B counter, ObjectId style).
-fn object_ids(
-    creds: &serde_json::Value,
-    pushes: &[(u16, Vec<u8>)],
-) -> ([u8; 12], [u8; 12]) {
+fn object_ids(creds: &serde_json::Value, pushes: &[(u16, Vec<u8>)]) -> ([u8; 12], [u8; 12]) {
     let from_hex = |v: Option<&str>| -> Option<[u8; 12]> {
         let s = v?;
         if s.len() != 24 {

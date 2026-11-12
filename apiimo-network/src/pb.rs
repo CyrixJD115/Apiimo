@@ -112,6 +112,9 @@ pub fn decode(data: &[u8]) -> Result<PbMessage, String> {
         let (key, next) = read_varint(data, pos)?;
         pos = next;
         let field = u32::try_from(key >> 3).map_err(|_| "field number overflow")?;
+        if field == 0 || field > 0x1fff_ffff {
+            return Err("invalid protobuf field number".into());
+        }
         let wire = (key & 7) as u8;
         match wire {
             0 => {
@@ -171,6 +174,9 @@ fn read_varint(data: &[u8], pos: usize) -> Result<(u64, usize), String> {
     loop {
         let byte = *data.get(index).ok_or("truncated varint")?;
         index += 1;
+        if shift == 63 && byte > 1 {
+            return Err("varint overflow".into());
+        }
         value |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return Ok((value, index));
@@ -185,6 +191,25 @@ fn read_varint(data: &[u8], pos: usize) -> Result<(u64, usize), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_overflowing_varints_and_invalid_tags() {
+        for last in [2, 127, 128, 255] {
+            let mut wire = vec![8];
+            wire.extend_from_slice(&[255; 9]);
+            wire.push(last);
+            assert!(decode(&wire).is_err());
+        }
+        let mut valid = vec![8];
+        valid.extend_from_slice(&[255; 9]);
+        valid.push(1);
+        assert_eq!(decode(&valid).unwrap().varint(1), Some(u64::MAX));
+        assert!(decode(&[0, 0]).is_err());
+        let mut oversized_tag = Vec::new();
+        write_varint(&mut oversized_tag, 0x2000_0000u64 << 3);
+        oversized_tag.push(0);
+        assert!(decode(&oversized_tag).is_err());
+    }
 
     #[test]
     fn round_trips_varints_and_bytes() {

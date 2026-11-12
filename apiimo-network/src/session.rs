@@ -1,6 +1,6 @@
 //! Authenticated gate session: "become the client".
 //!
-//! Wire model, fully reverse-engineered and live-verified (2026-09-25):
+//! Wire model used here, based on the repository's 2026-09-25 capture analysis:
 //! - Handshake is plaintext framed: m1 requestEncryptToken ->
 //!   [m19 gate-info push] + m10 responseEncryptToken{token} -> m2
 //!   confirmEncryptKey{RSA-OAEP-SHA1(head,key,token,tail)} -> m11
@@ -17,54 +17,30 @@
 use crate::client::{GateConnection, GateError, SessionKeyMaterial};
 use crate::handshake::ConnectServerReq;
 use crate::pb::{decode, PbMessage};
-use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 
-/// Continuous RC4 keystream (KSA once, keystream never resyncs).
-struct Rc4Stream {
-    s: [u8; 256],
-    i: usize,
-    j: usize,
-}
-
-impl Rc4Stream {
-    fn new(key: &[u8]) -> Self {
-        let mut s = [0u8; 256];
-        for (i, v) in s.iter_mut().enumerate() {
-            *v = i as u8;
-        }
-        let mut j = 0usize;
-        for i in 0..256 {
-            j = (j + s[i] as usize + key[i % key.len()] as usize) & 0xff;
-            s.swap(i, j);
-        }
-        Self { s, i: 0, j: 0 }
-    }
-
-    fn crypt(&mut self, data: &mut [u8]) {
-        for b in data.iter_mut() {
-            self.i = (self.i + 1) & 0xff;
-            self.j = (self.j + self.s[self.i] as usize) & 0xff;
-            self.s.swap(self.i, self.j);
-            *b ^= self.s[(self.s[self.i] as usize + self.s[self.j] as usize) & 0xff];
-        }
-    }
-}
+use aniimo_gate_codec::{StreamEncoder, StreamDecoder};
 
 /// A live, cipher-protected gate session.
 pub struct LiveSession {
     pub conn: GateConnection,
     pub key: Vec<u8>,
     next_rid: u64,
-    c2s_rc4: Rc4Stream,
-    s2c_rc4: Rc4Stream,
-    c2s_zlib: Compress,
-    s2c_zlib: Decompress,
-    /// inflated-but-unparsed s2c bytes
-    parse_buf: Vec<u8>,
-    /// raw s2c bytes awaiting decryption
-    rbuf: Vec<u8>,
+    transmit: StreamEncoder,
+    receive: StreamDecoder,
     /// pushes received while waiting for other messages (method, body)
     pub pushes: Vec<(u16, Vec<u8>)>,
+}
+
+const MAX_QUEUED_PUSHES: usize = 1024;
+const MAX_QUEUED_PUSH_BYTES: usize = 16 * 1024 * 1024;
+
+fn queue_push(pushes: &mut Vec<(u16, Vec<u8>)>, frame: (u16, Vec<u8>)) -> Result<(), GateError> {
+    let bytes = pushes.iter().try_fold(frame.1.len(), |sum, (_, body)| sum.checked_add(body.len()));
+    if pushes.len() >= MAX_QUEUED_PUSHES || bytes.map_or(true, |n| n > MAX_QUEUED_PUSH_BYTES) {
+        return Err(GateError::Io(std::io::Error::other("pending push budget exceeded; drain pushes before continuing")));
+    }
+    pushes.push(frame);
+    Ok(())
 }
 
 impl LiveSession {
@@ -79,88 +55,52 @@ impl LiveSession {
         let mut conn = GateConnection::connect(host, port, std::time::Duration::from_secs(8))?;
         // 1. requestEncryptToken
         conn.write_frame(1, &[])?;
-        // 2. responseEncryptToken (plaintext) - may follow a gate-info push.
-        //    Buffered parse: a single recv can carry several frames.
-        let debug = std::env::var("APIIMO_SESSION_DEBUG").is_ok();
-        let mut plain = Vec::new();
-        let token = loop {
-            let mut tmp = [0u8; 8192];
-            let n = {
-                use std::io::Read as _;
-                match std::io::Read::read(&mut conn.stream, &mut tmp) {
-                    Ok(n) => n,
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => 0,
-                    Err(e) => return Err(e.into()),
-                }
-            };
-            plain.extend_from_slice(&tmp[..n]);
-            let mut pos = 0usize;
-            let mut found = None;
-            while pos + 6 <= plain.len() {
-                let total = u32::from_le_bytes([
-                    plain[pos], plain[pos+1], plain[pos+2], plain[pos+3],
-                ]) as usize;
-                if total < 2 || pos + 4 + total > plain.len() { break; }
-                let method = u16::from_le_bytes([plain[pos+4], plain[pos+5]]);
-                if debug {
-                    eprintln!("[session] plain m{method} {}B", total - 2);
-                }
-                if method == 10 {
-                    let m = decode(&plain[pos+6..pos+4+total])
-                        .map_err(|e| GateError::Io(std::io::Error::other(e)))?;
-                    found = Some(m.varint(1).ok_or_else(|| GateError::Io(
-                        std::io::Error::other("token field missing")))? as i64);
-                }
-                pos += 4 + total;
-                if found.is_some() { break; }
+        // Await a plaintext token without reading beyond its frame boundary.
+        // Confirmation then commits the receive direction to encrypted zlib.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut pushes = Vec::new();
+        let mut token = None;
+        for _ in 0..64 {
+            let frame = crate::client::read_frame(&mut crate::client::DeadlineReader {
+                stream: &mut conn.stream, deadline,
+            })?.ok_or_else(|| GateError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof, "gate closed before token")))?;
+            if frame.method == 10 {
+                let message = decode(&frame.body).map_err(|e| GateError::Io(std::io::Error::other(e)))?;
+                token = Some(message.varint(1).ok_or_else(|| GateError::Io(
+                    std::io::Error::other("token field missing")))? as i64);
+                break;
             }
-            plain.drain(..pos);
-            if let Some(t) = found {
-                break t;
-            }
-            if n == 0 && plain.is_empty() {
-                return Err(GateError::Io(std::io::Error::other("gate closed before token")));
-            }
-        };
+            if frame.method != 19 { return Err(GateError::Io(std::io::Error::other("unexpected plaintext handshake method"))); }
+            queue_push(&mut pushes, (frame.method, frame.body))?;
+        }
+        let token = token.ok_or_else(|| GateError::Io(std::io::Error::other("plaintext handshake frame limit exceeded")))?;
         // 3. generate OUR key, RSA-OAEP-SHA1 wrap, confirmEncryptKey
         let material = SessionKeyMaterial::generate();
         let ciphertext = oaep_sha1_wrap(gate_public_key_der, &material, token)?;
         let key_string = crate::handshake::EncryptKeyString { key_string: ciphertext }.encode_pb();
         conn.write_frame(2, &key_string)?;
-        // 4. read the encrypted ack (+ possibly late plaintext pushes).
-        //    Bytes that arrived in the same recv as the token (early
-        //    ciphertext) must not be dropped.
+        // From here onward every received byte belongs to the cipher stream.
         let mut session = LiveSession {
             conn,
             key: material.key.clone(),
             next_rid: 1,
-            c2s_rc4: Rc4Stream::new(&material.key),
-            s2c_rc4: Rc4Stream::new(&material.key),
-            // The real client compresses c2s with zlib LEVEL 0 (stored
-            // blocks): the captured 573B first message is a 562B frame plus
-            // the 11-byte stored-block + zlib-wrapper overhead, and level 6
-            // would compress the b64 ticket far below the observed sizes.
-            c2s_zlib: Compress::new(Compression::none(), true),
-            s2c_zlib: Decompress::new(true),
-            parse_buf: Vec::new(),
-            rbuf: plain.drain(..).collect(),
-            pushes: Vec::new(),
+            transmit: StreamEncoder::new(&material.key).map_err(|e| GateError::Io(std::io::Error::other(e)))?,
+            receive: StreamDecoder::new(&material.key).map_err(|e| GateError::Io(std::io::Error::other(e)))?,
+            pushes,
         };
         let ack_deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
-        let mut ack_frames = Vec::new();
-        // The ack arrives in small TCP segments (the server split 2B + 8B +
-        // 4B in the capture); keep reading until m11 shows up.
-        while !ack_frames.iter().any(|(m, _): &(u16, Vec<u8>)| *m == 11) {
+        let mut acknowledged = false;
+        while !acknowledged {
             let left = ack_deadline.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero() {
-                break;
+            if left.is_zero() { break; }
+            for (method, body) in session.read_frames(left)? {
+                if method == 11 { acknowledged = true; }
+                else { queue_push(&mut session.pushes, (method, body))?; }
             }
-            ack_frames = session.read_frames(left)?;
         }
-        if !ack_frames.iter().any(|(m, _)| *m == 11) {
-            return Err(GateError::Io(std::io::Error::other(
-                "no confirmEncryptKeyAck (gate rejected the key)",
-            )));
+        if !acknowledged {
+            return Err(GateError::Io(std::io::Error::other("no confirmEncryptKeyAck before deadline")));
         }
         Ok(session)
     }
@@ -168,135 +108,27 @@ impl LiveSession {
     /// Encrypt+send one dispatch: framed message -> continuous zlib (sync
     /// flush) -> continuous RC4 -> socket.
     pub fn send(&mut self, method: u16, body: &[u8]) -> Result<(), GateError> {
-        let mut framed = Vec::with_capacity(body.len() + 6);
-        framed.extend_from_slice(&((body.len() + 2) as u32).to_le_bytes());
-        framed.extend_from_slice(&method.to_le_bytes());
-        framed.extend_from_slice(body);
-        let mut out = Vec::new();
-        let mut chunk = vec![0u8; framed.len() + 64];
-        // feed the whole framed message into the continuous deflate stream
-        let mut in_pos = 0usize;
-        while in_pos < framed.len() {
-            let before_in = self.c2s_zlib.total_in();
-            let before_out = self.c2s_zlib.total_out();
-            self.c2s_zlib
-                .compress(&framed[in_pos..], &mut chunk, FlushCompress::None)
-                .map_err(|e| GateError::Io(std::io::Error::other(e.to_string())))?;
-            let consumed = (self.c2s_zlib.total_in() - before_in) as usize;
-            let produced = (self.c2s_zlib.total_out() - before_out) as usize;
-            out.extend_from_slice(&chunk[..produced]);
-            in_pos += consumed;
-        }
-        // sync flush drains the deflate buffer but keeps the stream open.
-        // CAUTION: at level 0 every repeated empty Sync call emits another
-        // empty stored block, so drain by buffer-fill (a single round
-        // suffices unless the output buffer is exceeded).
-        loop {
-            let before_out = self.c2s_zlib.total_out();
-            let status = self
-                .c2s_zlib
-                .compress(&[], &mut chunk, FlushCompress::Sync)
-                .map_err(|e| GateError::Io(std::io::Error::other(e.to_string())))?;
-            let produced = (self.c2s_zlib.total_out() - before_out) as usize;
-            out.extend_from_slice(&chunk[..produced]);
-            if produced < chunk.len() || matches!(status, Status::StreamEnd) {
-                break;
-            }
-        }
-        self.c2s_rc4.crypt(&mut out);
-        use std::io::Write;
-        self.conn.stream.write_all(&out)?;
-        self.conn.stream.flush()?;
+        self.transmit.write_frame(&mut self.conn.stream, method, body)?;
         Ok(())
     }
 
-    /// Read socket data, run it through the continuous RC4 + zlib and
-    /// return every complete dispatch frame. Late plaintext pushes (m19
-    /// style) are tolerated and surfaced in `pushes`.
+    /// Decode post-confirmation bytes. Plaintext-looking ciphertext is never
+    /// stripped; a peer that violates the negotiated phase fails decoding.
     pub fn read_frames(
         &mut self,
         timeout: std::time::Duration,
     ) -> Result<Vec<(u16, Vec<u8>)>, GateError> {
-        let raw = self.conn.read_raw(timeout)?;
-        self.rbuf.extend_from_slice(&raw);
-        let mut out = Vec::new();
-        // 1. strip leading plaintext pushes (m19-style, arrive unframed-encrypted
-        //    only after the cipher starts; before that they are plain frames)
-        loop {
-            if self.rbuf.len() < 6 || !self.parse_buf.is_empty() {
-                break;
-            }
-            let total = u32::from_le_bytes([
-                self.rbuf[0],
-                self.rbuf[1],
-                self.rbuf[2],
-                self.rbuf[3],
-            ]) as usize;
-            let method = u16::from_le_bytes([self.rbuf[4], self.rbuf[5]]);
-            let plain_frame = total >= 2
-                && total <= 0x200000
-                && 4 + total <= self.rbuf.len()
-                && (9..=24).contains(&method)
-                && crate::pb::decode(&self.rbuf[6..4 + total]).is_ok();
-            if plain_frame {
-                out.push((method, self.rbuf[6..4 + total].to_vec()));
-                self.rbuf.drain(..4 + total);
-                continue;
-            }
-            break;
-        }
-        // 2. decrypt everything buffered with the continuous keystream
-        if !self.rbuf.is_empty() {
-            if std::env::var("APIIMO_SESSION_DEBUG").is_ok() {
-                eprintln!("[session] enc-in {}B {}",
-                    self.rbuf.len(),
-                    self.rbuf.iter().take(32).map(|b| format!("{b:02x}")).collect::<String>());
-            }
-            self.s2c_rc4.crypt(&mut self.rbuf);
-            if std::env::var("APIIMO_SESSION_DEBUG").is_ok() {
-                eprintln!("[session] enc-dec {}",
-                    self.rbuf.iter().take(32).map(|b| format!("{b:02x}")).collect::<String>());
-            }
-            // 3. inflate into the parse buffer (local cursor over rbuf;
-            //    zlib totals are cumulative across the whole stream)
-            let mut out_chunk = vec![0u8; 1 << 20];
-            let mut cursor = 0usize;
-            while cursor < self.rbuf.len() {
-                let before_in = self.s2c_zlib.total_in();
-                let before_out = self.s2c_zlib.total_out();
-                let _status = self
-                    .s2c_zlib
-                    .decompress(
-                        &self.rbuf[cursor..],
-                        &mut out_chunk,
-                        FlushDecompress::None,
-                    )
-                    .map_err(|e| GateError::Io(std::io::Error::other(e.to_string())))?;
-                let produced = (self.s2c_zlib.total_out() - before_out) as usize;
-                let consumed = (self.s2c_zlib.total_in() - before_in) as usize;
-                self.parse_buf.extend_from_slice(&out_chunk[..produced]);
-                cursor += consumed;
-                if produced == 0 && consumed == 0 {
-                    break; // needs more input bytes
-                }
-            }
-            self.rbuf.clear();
-        }
-        // 4. parse framed dispatches from the inflated stream
-        let mut pos = 0usize;
-        let buf = std::mem::take(&mut self.parse_buf);
-        while pos + 6 <= buf.len() {
-            let total = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
-                as usize;
-            if total < 2 || pos + 4 + total > buf.len() {
-                break; // incomplete frame; keep for next read
-            }
-            let method = u16::from_le_bytes([buf[pos + 4], buf[pos + 5]]);
-            out.push((method, buf[pos + 6..pos + 4 + total].to_vec()));
-            pos += 4 + total;
-        }
-        self.parse_buf = buf[pos..].to_vec();
-        Ok(out)
+        use std::io::Read;
+        if timeout.is_zero() { return Ok(Vec::new()); }
+        self.conn.stream.set_read_timeout(Some(timeout))?;
+        let mut bytes = [0u8;4096];
+        let read = match self.conn.stream.read(&mut bytes) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "encrypted gate stream closed").into()),
+            Ok(read) => read,
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        self.receive.feed(&bytes[..read]).map_err(|e| GateError::Io(std::io::Error::other(e)))
     }
 
     /// MicroServiceRequest: `service.method(params)`. The byte-exact shape
@@ -312,7 +144,7 @@ impl LiveSession {
         timeout: std::time::Duration,
     ) -> Result<Vec<u8>, GateError> {
         let rid = self.next_rid;
-        self.next_rid += 1;
+        self.next_rid = self.next_rid.checked_add(1).ok_or_else(|| GateError::Io(std::io::Error::other("request identifiers exhausted")))?;
         let mut m = PbMessage::new();
         m.set_varint(1, rid);
         m.set_string(2, service);
@@ -331,15 +163,18 @@ impl LiveSession {
                 )));
             }
             let frames = self.read_frames(left.min(std::time::Duration::from_millis(500)))?;
+            let mut response = None;
             for (method_id, body) in frames {
                 // MicroServiceResponse: {1: rid, 2: params}
                 if let Ok(resp) = decode(&body) {
-                    if resp.varint(1) == Some(rid) {
-                        return Ok(resp.bytes(2).unwrap_or_default().to_vec());
+                    if response.is_none() && resp.varint(1) == Some(rid) {
+                        response = Some(resp.bytes(2).unwrap_or_default().to_vec());
+                        continue;
                     }
                 }
-                self.pushes.push((method_id, body));
+                queue_push(&mut self.pushes, (method_id, body))?;
             }
+            if let Some(response) = response { return Ok(response); }
         }
     }
 
@@ -396,6 +231,7 @@ fn mp_string(out: &mut Vec<u8>, s: &str) {
 
 #[cfg(test)]
 mod tests {
+    use flate2::{Compress, Compression, FlushCompress};
     use super::*;
 
     /// The real client's first encrypted write was 573 bytes on the wire for
@@ -489,4 +325,19 @@ fn oaep_sha1_wrap(
                 format!("oaep wrap failed: {error}"),
             ))
         })
+}
+
+#[cfg(test)]
+mod queue_budget_tests {
+    use super::*;
+    #[test]
+    fn rejects_count_and_byte_overflow_without_mutating_queue() {
+        let mut pushes=vec![(19,Vec::new());MAX_QUEUED_PUSHES];
+        assert!(queue_push(&mut pushes,(19,vec![1])).is_err());
+        assert_eq!(pushes.len(),MAX_QUEUED_PUSHES);
+        let mut pushes=vec![(19,vec![0;MAX_QUEUED_PUSH_BYTES])];
+        assert!(queue_push(&mut pushes,(19,vec![1])).is_err()); assert_eq!(pushes.len(),1);
+        pushes.clear(); queue_push(&mut pushes,(19,vec![1])).unwrap();
+        assert_eq!(pushes,vec![(19,vec![1])]);
+    }
 }
