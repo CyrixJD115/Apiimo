@@ -20,6 +20,17 @@ const EMPTY_SECTIONS: [&str; 3] = [
     "windowsRuntimeStrings",
 ];
 
+/// Opt-in step trace for diagnosing a new build: set
+/// `APIIMO_DISCOVER_TRACE=1` to print every anchor discovery resolves, so
+/// the step that drifted on an update is visible without a debugger.
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        if std::env::var_os("APIIMO_DISCOVER_TRACE").is_some() {
+            eprintln!("discover: {}", format_args!($($arg)*));
+        }
+    };
+}
+
 fn invalid(reason: &str) -> Error {
     Error::InvalidMetadata(format!("layout discovery failed: {reason}"))
 }
@@ -50,7 +61,104 @@ fn rd16(buf: &[u8], off: usize) -> Result<u16, Error> {
 /// must start its token run, and record 0 of that table must name
 /// <Module> in the identifier heap. Coincidence matches inside other
 /// tables die somewhere along that chain.
-fn assemblies_candidate_ok(buf: &[u8], candidate: usize) -> bool {
+///
+/// Returns the identifier-heap start (one of `heap_candidates`) under which
+/// typedef 0 resolves to <Module>, so the heap position is proven by the
+/// data rather than assumed.
+fn assemblies_candidate_ok(buf: &[u8], candidate: usize, heap_candidates: &[usize]) -> Option<usize> {
+    if !assemblies_chain_ok(buf, candidate) {
+        return None;
+    }
+    let count = index_run_len(buf, candidate, 64);
+    let img_start = candidate - count * 40;
+    let mut type_defs = 0_usize;
+    for i in 0..count {
+        let record = img_start + i * 40;
+        let start = rd32(buf, record + 8).ok()?;
+        if start != 0xFFFF_FFFF {
+            type_defs = type_defs.max(start as usize + rd32(buf, record + 12).ok()? as usize);
+        }
+    }
+    let name_index = rd32(buf, img_start - type_defs * 88).ok()?;
+    heap_candidates
+        .iter()
+        .copied()
+        .find(|&heap| heap_string(buf, heap, name_index, candidate) == Some(b"<Module>"))
+}
+
+/// Total generic parameters declared by the container table:
+/// `max(genericParameterStart + type_argc)` over 16-byte records
+/// `{ownerIndex, type_argc, is_method, genericParameterStart}`.
+fn generic_param_total(buf: &[u8], gc_start: usize, containers: usize) -> Result<usize, Error> {
+    let mut total = 0_usize;
+    for i in 0..containers {
+        let record = gc_start + i * 16;
+        let argc = rd32(buf, record + 4)? as usize;
+        let start = rd32(buf, record + 12)? as usize;
+        total = total.max(start + argc);
+    }
+    Ok(total)
+}
+
+/// Largest `constraintsStart + constraintsCount` over `count` parameter
+/// records starting at `start`.
+fn max_constraint_ref(buf: &[u8], start: usize, count: usize) -> Option<usize> {
+    let mut max_ref = 0_usize;
+    for record in 0..count {
+        let at = start + record * 16;
+        let constraints = rd16(buf, at + 10).ok()? as i16;
+        if constraints > 0 {
+            let first = (rd16(buf, at + 8).ok()? as i16).max(0) as usize;
+            max_ref = max_ref.max(first + constraints as usize);
+        }
+    }
+    Some(max_ref)
+}
+
+/// Pin the genericParameters extent from the container-declared count.
+/// Candidates run from `loose_end` down to `strict_end` on the record grid;
+/// the first one whose last record is owned by the last container and
+/// whose constraint references fit before `gc_start` wins.
+fn exact_generic_param_extent(
+    buf: &[u8],
+    total: usize,
+    strict_end: usize,
+    loose_end: usize,
+    gc_start: usize,
+    containers: usize,
+) -> Option<(usize, usize)> {
+    if total == 0 || containers == 0 {
+        return None;
+    }
+    let last_container = (containers - 1) as u32;
+    let mut end = loose_end;
+    while end >= strict_end {
+        if let Some(start) = end.checked_sub(total * 16) {
+            if eq32(buf, end - 16, last_container) && eq32(buf, start, 0) {
+                if let Some(max_ref) = max_constraint_ref(buf, start, total) {
+                    if max_ref * 4 <= gc_start - end {
+                        trace!("genericParameters pinned by containers: total={total} start={start:#x} end={end:#x} constraint_refs={max_ref}");
+                        return Some((start, end));
+                    }
+                }
+            }
+        }
+        end = end.checked_sub(16)?;
+    }
+    None
+}
+
+fn index_run_len(buf: &[u8], start: usize, stride: usize) -> usize {
+    let mut count = 0_usize;
+    while start + (count + 1) * stride <= buf.len() && eq32(buf, start + count * stride, count as u32) {
+        count += 1;
+    }
+    count
+}
+
+/// Structural half of the assemblies check: index runs and the typedef
+/// token run, independent of where the identifier heap begins.
+fn assemblies_chain_ok(buf: &[u8], candidate: usize) -> bool {
     let mut count = 0_usize;
     while candidate + (count + 1) * 64 <= buf.len()
         && eq32(buf, candidate + count * 64, count as u32)
@@ -86,37 +194,20 @@ fn assemblies_candidate_ok(buf: &[u8], candidate: usize) -> bool {
     let Some(td_start) = img_start.checked_sub(type_defs * 88) else {
         return false;
     };
-    if !eq32(buf, td_start + 84, 0x0200_0001) || !eq32(buf, td_start + 88 + 84, 0x0200_0002) {
-        return false;
-    }
-    let string_start = string_heap_start(buf).unwrap_or(0);
-    if string_start == 0 {
-        return false;
-    }
-    matches!(
-        rd32(buf, td_start),
-        Ok(index) if heap_string(buf, string_start, index, candidate) == Some(b"<Module>")
-    )
+    eq32(buf, td_start + 84, 0x0200_0001) && eq32(buf, td_start + 88 + 84, 0x0200_0002)
 }
 
-/// The identifier heap starts right after the stringLiteral data blob.
-fn string_heap_start(buf: &[u8]) -> Option<usize> {
-    let mut lit_count = 0_usize;
-    let mut lit_bytes = 0_usize;
-    while 0x100 + (lit_count + 1) * 8 <= buf.len() {
-        let (Ok(length), Ok(data_index)) = (rd32(buf, 0x100 + lit_count * 8), rd32(buf, 0x100 + lit_count * 8 + 4)) else {
-            break;
-        };
-        if length > 0x10000 || data_index != lit_bytes as u32 {
-            break;
-        }
-        lit_bytes += length as usize;
-        lit_count += 1;
-        if lit_count > 300_000 {
-            break;
-        }
-    }
-    Some(0x100 + lit_count * 8 + lit_bytes + 1)
+/// Candidate identifier-heap starts after the stringLiteralData blob, most
+/// likely first. The builder aligns the heap to 4 bytes: builds V1-V5 ended
+/// literal data at offset 3 mod 4, so the old "end + 1" rule coincided with
+/// alignment, and the 2026-11-12 build ends already aligned with no pad
+/// byte, which broke that rule. The unpadded and single-pad fallbacks keep
+/// discovery self-correcting if the padding rule changes again; the
+/// <Module> check in [`assemblies_candidate_ok`] selects the true start.
+fn heap_start_candidates(data_end: usize) -> Vec<usize> {
+    let mut candidates = vec![data_end.next_multiple_of(4), data_end + 1, data_end];
+    candidates.dedup();
+    candidates
 }
 
 fn eq32(buf: &[u8], off: usize, value: u32) -> bool {
@@ -159,26 +250,30 @@ pub fn discover_layout(buf: &[u8]) -> Result<MetadataLayout, Error> {
     sections.insert("stringLiteral", MetadataSection::new(lit_start, lit_count * 8));
     let data_start = lit_start + lit_count * 8;
     sections.insert("stringLiteralData", MetadataSection::new(data_start, lit_bytes));
-    let string_start = data_start + lit_bytes + 1;
-    if string_start >= buf.len() {
+    let data_end = data_start + lit_bytes;
+    let heap_candidates = heap_start_candidates(data_end);
+    if heap_candidates.iter().all(|&start| start >= buf.len()) {
         return Err(invalid("string heap start is past the end of the buffer"));
     }
 
     // 2. assemblies anchor: imageIndex counts 0,1,2,... at stride 64, with
     //    the images table (assemblyIndex run at stride 40) directly below.
     //    Isolated index patterns occur by coincidence inside other tables,
-    //    so each candidate is fully validated before it is accepted.
-    // The heap start can sit at any byte alignment; every record table is
-    // 4-byte aligned, so scan from the next aligned offset.
-    let scan_from = string_start.next_multiple_of(4);
+    //    so each candidate is fully validated before it is accepted. The
+    //    validation also fixes the identifier-heap start (see
+    //    [`heap_start_candidates`]). Every record table is 4-byte aligned.
+    let scan_from = data_end.next_multiple_of(4);
     let mut anchor = None;
     for candidate in (scan_from..buf.len().saturating_sub(2 * 64)).step_by(4) {
-        if assemblies_candidate_ok(buf, candidate) {
-            anchor = Some(candidate);
+        if let Some(heap) = assemblies_candidate_ok(buf, candidate, &heap_candidates) {
+            anchor = Some((candidate, heap));
             break;
         }
     }
-    let asm_start = anchor.ok_or_else(|| invalid("assemblies index run not found"))?;
+    let (asm_start, string_start) = anchor.ok_or_else(|| {
+        invalid("assemblies index run not found (no candidate resolved typedef 0 to <Module>)")
+    })?;
+    trace!("literals={lit_count} data_end={data_end:#x} heap={string_start:#x} (candidates {heap_candidates:x?}) assemblies={asm_start:#x}");
     let mut asm_count = 0_usize;
     while asm_start + (asm_count + 1) * 64 <= buf.len()
         && eq32(buf, asm_start + asm_count * 64, asm_count as u32)
@@ -308,6 +403,7 @@ pub fn discover_layout(buf: &[u8]) -> Result<MetadataLayout, Error> {
     tile_down(&mut sections, &mut cursor, "nestedTypes", 4, maxima.nested_types)?;
     tile_down(&mut sections, &mut cursor, "genericContainers", 16, maxima.generic_containers)?;
     let gc_start = cursor;
+    trace!("typeDefinitions={td_start:#x} types={type_defs} methods={methods_start:#x}..{methods_end:#x} events={events_start:#x} genericContainers={gc_start:#x}");
 
     // 8. genericParameters and its constraint index live below the
     //    containers. Records are 16 bytes with short T-style names, and the
@@ -356,9 +452,31 @@ pub fn discover_layout(buf: &[u8]) -> Result<MetadataLayout, Error> {
     {
         gp_end += 16;
     }
+    // The name heuristics above only bracket the table. The containers state
+    // the exact parameter count (max genericParameterStart + type_argc), so
+    // pin the extent with it: walk the end down from the loose estimate to
+    // the first position where that many records end with a parameter owned
+    // by the last container and every constraint reference fits in the
+    // bytes left before the containers. This rejects constraint entries
+    // that happen to resolve to heap names (seen on the 2026-11-12 build,
+    // where the loose walk overshot by 10 records) and restores leading
+    // parameters whose names fail the strict T-name test.
+    let gp_total = generic_param_total(buf, gc_start, maxima.generic_containers)?;
+    let (gp_start, gp_end) = match exact_generic_param_extent(
+        buf,
+        gp_total,
+        strict_end,
+        gp_end,
+        gc_start,
+        maxima.generic_containers,
+    ) {
+        Some(extent) => extent,
+        None => (gp_start, gp_end),
+    };
     let gp_size = gp_end - gp_start;
     sections.insert("genericParameters", MetadataSection::new(gp_start, gp_size));
     let gpc_count = (gc_start - gp_end) / 4;
+    trace!("genericParameters strict_run={gp_run} start={gp_start:#x} strict_end={strict_end:#x} end={gp_end:#x} constraint_slots={gpc_count}");
     let mut max_ref = 0_usize;
     for record in 0..gp_size / 16 {
         let at = gp_start + record * 16;
@@ -368,6 +486,7 @@ pub fn discover_layout(buf: &[u8]) -> Result<MetadataLayout, Error> {
             max_ref = max_ref.max(start + constraints);
         }
     }
+    trace!("genericParameter constraint references reach {max_ref}");
     if max_ref > gpc_count {
         return Err(invalid(
             "genericParameter constraints reference past the constraint index",
@@ -696,6 +815,11 @@ mod tests {
     /// token run, a methods token run, per-image indices, and a T-name
     /// generic parameter table.
     fn build_fixture() -> (Vec<u8>, Vec<(&'static str, MetadataSection)>) {
+        // 46 literal bytes end at 0x16E: two pad bytes before the heap.
+        build_fixture_with(&[3, 4, 5, 4, 7, 8, 9, 6])
+    }
+
+    fn build_fixture_with(lengths: &[u32]) -> (Vec<u8>, Vec<(&'static str, MetadataSection)>) {
         let mut heap = Vec::new();
         let n_module = put_str(&mut heap, "<Module>");
         let n_object = put_str(&mut heap, "GameObject");
@@ -729,20 +853,23 @@ mod tests {
         };
         let _ = n_object;
 
-        // stringLiteral chain: 8 literals totalling 46 bytes.
-        let lengths = [3_u32, 4, 5, 4, 7, 8, 9, 6];
+        // stringLiteral chain.
         let lit_table = mark(&mut buf, &mut expect, "stringLiteral");
         let mut running = 0_u32;
-        for length in lengths {
+        for &length in lengths {
             put32(&mut buf, length);
             put32(&mut buf, running);
             running += length;
         }
-        expect.iter_mut().find(|(n, _)| *n == "stringLiteral").unwrap().1.size = 64;
+        expect.iter_mut().find(|(n, _)| *n == "stringLiteral").unwrap().1.size = lengths.len() * 8;
         let lit_data = mark(&mut buf, &mut expect, "stringLiteralData");
         buf.extend(std::iter::repeat(b'x').take(running as usize));
         expect.iter_mut().find(|(n, _)| *n == "stringLiteralData").unwrap().1.size = running as usize;
-        buf.push(0); // separator before the identifier heap
+        // The builder aligns the identifier heap to 4 bytes (zero pad, which
+        // may be empty when the literal data already ends aligned).
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
 
         let string_start = mark(&mut buf, &mut expect, "string");
         buf.extend_from_slice(&heap);
@@ -1007,8 +1134,39 @@ mod tests {
     #[test]
     fn discover_layout_recovers_every_section() {
         let (buf, expect) = build_fixture();
-        let layout = discover_layout(&buf).unwrap();
-        for (name, section) in &expect {
+        assert_layout_matches(&buf, &expect);
+    }
+
+    /// V1-V5 shape: literal data ends at 3 mod 4, one pad byte.
+    #[test]
+    fn discover_layout_handles_single_pad_byte_heap() {
+        // 0x140 + 47 = 0x16F
+        let (buf, expect) = build_fixture_with(&[3, 4, 5, 4, 7, 8, 9, 7]);
+        assert_layout_matches(&buf, &expect);
+    }
+
+    /// 2026-11-12 shape: literal data already ends 4-byte aligned, so the
+    /// heap starts immediately with no pad byte. The old "end + 1" rule
+    /// misread every heap name by one byte and lost the assemblies anchor.
+    #[test]
+    fn discover_layout_handles_aligned_heap_without_pad() {
+        // 0x140 + 48 = 0x170
+        let (buf, expect) = build_fixture_with(&[3, 4, 5, 4, 7, 8, 9, 8]);
+        let string = expect.iter().find(|(n, _)| *n == "string").unwrap().1;
+        assert_eq!(string.offset, 0x170, "fixture must model the unpadded case");
+        assert_layout_matches(&buf, &expect);
+    }
+
+    #[test]
+    fn heap_candidates_prefer_alignment() {
+        assert_eq!(heap_start_candidates(0x16F)[0], 0x170);
+        assert_eq!(heap_start_candidates(0x170)[0], 0x170);
+        assert!(heap_start_candidates(0x170).contains(&0x171));
+    }
+
+    fn assert_layout_matches(buf: &[u8], expect: &[(&'static str, MetadataSection)]) {
+        let layout = discover_layout(buf).unwrap();
+        for (name, section) in expect {
             let found = layout
                 .get(name)
                 .unwrap_or_else(|| panic!("section {name} missing from discovered layout"));
